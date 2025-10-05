@@ -11,5 +11,5 @@ An ERPNext app to integrate Sales Invoices with Jordan's National E-Invoicing (J
 
 ## Install
 ```bash
-bench get-app erpnext_jofotara https://github.com/you/erpnext_jofotara.git
-bench --site your.site install-app erpnext_jofotara
+bench get-app erpnext_jofotara https://github.com/mostafael3ref/erpnext_jofotara.git
+bench --site <your-site> install-app erpnext_jofotara
