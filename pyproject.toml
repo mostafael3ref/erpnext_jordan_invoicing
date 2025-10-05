@@ -1,0 +1,16 @@
+[project]
+name = "erpnext_jofotara"
+version = "0.1.0"
+description = "ERPNext integration with Jordan JoFotara e-invoicing"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Mustafa Al-Areef", email = "dev@example.com" }]
+
+dependencies = [
+  "requests>=2.31.0",
+  "lxml>=4.9.3"
+]
+
+[tool.setuptools.packages.find]
+include = ["erpnext_jofotara"]

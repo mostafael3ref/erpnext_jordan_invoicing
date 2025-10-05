@@ -1,0 +1,40 @@
+{
+  "name": "JoFotara Settings",
+  "module": "ERPNext JoFotara",
+  "doctype": "DocType",
+  "custom": 0,
+  "istable": 0,
+  "editable_grid": 0,
+  "read_only": 0,
+  "track_changes": 1,
+  "is_submittable": 0,
+  "issingle": 1,
+  "allow_rename": 0,
+  "fields": [
+    {"label": "Enable OAuth2", "fieldname": "use_oauth2", "fieldtype": "Check", "default": "1"},
+    {"label": "Send on Submit", "fieldname": "send_on_submit", "fieldtype": "Check", "default": "1"},
+
+    {"label": "Activity Number", "fieldname": "activity_number", "fieldtype": "Data", "reqd": 1},
+    {"label": "Client ID", "fieldname": "client_id", "fieldtype": "Data"},
+    {"label": "Secret Key", "fieldname": "secret_key", "fieldtype": "Password"},
+
+    {"label": "Device User (Alt Auth)", "fieldname": "device_user", "fieldtype": "Data"},
+    {"label": "Device Secret (Alt Auth)", "fieldname": "device_secret", "fieldtype": "Password"},
+
+    {"label": "Base URL", "fieldname": "base_url", "fieldtype": "Data",
+     "default": "https://portal.jofotara.gov.jo"},
+    {"label": "Token URL", "fieldname": "token_url", "fieldtype": "Data",
+     "default": "/connect/token"},
+    {"label": "Submit URL", "fieldname": "submit_url", "fieldtype": "Data",
+     "default": "/api/v1/invoices"},
+    {"label": "Cancel URL", "fieldname": "cancel_url", "fieldtype": "Data",
+     "default": "/api/v1/invoices/cancel"},
+    {"label": "Query URL", "fieldname": "query_url", "fieldtype": "Data",
+     "default": "/api/v1/invoices/status"},
+
+    {"label": "Payload Format", "fieldname": "payload_format", "fieldtype": "Select",
+     "options": "XML_UPL_2_1\nJSON", "default": "XML_UPL_2_1"},
+
+    {"label": "Sandbox Mode", "fieldname": "sandbox_mode", "fieldtype": "Check", "default": "0"}
+  ]
+}
