@@ -14,3 +14,7 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["erpnext_jofotara"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
