@@ -1,92 +1,111 @@
 import json
 import frappe
 from frappe import _
-from frappe.utils import cint
-from .client import auth_headers, post, post_xml
-from .transform import invoice_to_json, invoice_to_upl21_xml_base64
+from frappe.utils import now
 
-def _get_settings():
-    return frappe.get_single("JoFotara Settings")
+# إعداد بسيط للتفعيل/التعطيل (تقدر لاحقًا تعمل Doctype Settings)
+def is_auto_send_enabled() -> bool:
+    # مستقبلاً: اقرأ من Doctype "JoFatora Settings"
+    return True
 
-def _ensure_fields(doc):
-    for fn in ("jofotara_status","jofotara_uuid","jofotara_qr"):
-        if not doc.meta.get_field(fn):
-            # في حال لم تتولد الحقول (لو after_install لم يعمل)
-            try:
-                doc.db_additionals()
-            except Exception:
-                pass
-
-@frappe.whitelist()
-def send_invoice(name: str):
-    doc = frappe.get_doc("Sales Invoice", name)
-    settings = _get_settings()
-    _ensure_fields(doc)
-
-    headers = auth_headers(settings)
-
-    if (settings.payload_format or "XML_UPL_2_1") == "XML_UPL_2_1":
-        # XML Base64 in JSON envelope (شائع في بعض التكاملات)
-        payload_b64 = invoice_to_upl21_xml_base64(doc, settings)
-        # معظم البوابات تقبل JSON بحقل data/base64؛ غيّر المفتاح إذا كان مختلفًا
-        body = {"activityNumber": settings.activity_number, "data": payload_b64}
-        resp = post(settings, settings.submit_url, json=body, headers=headers)
-    else:
-        body = invoice_to_json(doc, settings)
-        resp = post(settings, settings.submit_url, json=body, headers=headers)
-
-    if resp.status_code >= 400:
-        doc.db_set("jofotara_status", "Failed")
-        frappe.throw(_("JoFotara submit failed: {0}").format(resp.text))
-
+def on_submit_send(doc, method=None):
+    """Hook: يُستدعى عند اعتماد Sales Invoice"""
     try:
-        out = resp.json()
-    except Exception:
-        out = {"raw": resp.text}
+        if not is_auto_send_enabled():
+            return
 
-    uuid = (out.get("uuid") or out.get("invoiceUUID") or "")
-    qr   = (out.get("qrCode") or out.get("qr") or "")
+        # ابني الحمولة (Payload) من الفاتورة
+        payload = build_jofotara_payload(doc)
+
+        # أرسلها (استبدل هذا بدالة حقيقية تتصل بـ JoFatora)
+        resp = submit_to_jofotara(payload)
+
+        # عالج الرد وخزّنه
+        handle_submit_response(doc, resp)
+
+        frappe.msgprint(_("JoFatora: Invoice submitted successfully"), alert=1, indicator="green")
+
+    except Exception as e:
+        # سجّل الخطأ وحدّث الحالة
+        doc.db_set("jofotara_status", "Error")
+        frappe.log_error(frappe.get_traceback(), "JoFatora Submit Error")
+        frappe.throw(_("JoFatora submission failed: {0}").format(str(e)))
+
+def build_jofotara_payload(doc):
+    """حوّل Sales Invoice إلى JSON أو XML حسب متطلبات JoFatora.
+       هنا مثال JSON مبسّط؛ عدّله لتطابق مخطط النظام الأردني."""
+    items = []
+    for it in doc.items:
+        items.append({
+            "item_code": it.item_code,
+            "item_name": it.item_name,
+            "qty": float(it.qty),
+            "rate": float(it.rate),
+            "amount": float(it.amount),
+            "uom": it.uom,
+        })
+
+    payload = {
+        "invoice_no": doc.name,
+        "posting_date": str(doc.posting_date),
+        "customer": doc.customer,
+        "company": doc.company,
+        "currency": doc.currency,
+        "total": float(doc.total),
+        "grand_total": float(doc.grand_total),
+        "taxes": [
+            {
+                "description": tx.description,
+                "rate": float(tx.rate or 0),
+                "amount": float(tx.tax_amount or 0),
+            } for tx in (doc.taxes or [])
+        ],
+        "items": items,
+    }
+    return payload
+
+def submit_to_jofotara(payload: dict) -> dict:
+    """استبدل هذا بتنفيذ حقيقي:
+       - قراءة الإعدادات (URLs, client_id, client_secret)
+       - إنشاء توكن إن لزم
+       - إرسال الطلب عبر requests
+       - إرجاع الرد كـ dict
+    """
+    # مثال محاكاة
+    return {
+        "status": "success",
+        "uuid": "JOFOTARA-UUID-123",
+        "qr": "BASE64-QR-STRING",
+        "timestamp": now(),
+        "raw": payload,  # لأغراض الاختبار فقط
+    }
+
+def handle_submit_response(doc, resp: dict):
+    """تحديث الحقول وتسجيل السجل (Log)"""
+    status = "Submitted" if resp.get("status") == "success" else "Error"
+    uuid = resp.get("uuid")
+    qr = resp.get("qr")
+
+    doc.db_set("jofotara_status", status)
     if uuid:
         doc.db_set("jofotara_uuid", uuid)
     if qr:
         doc.db_set("jofotara_qr", qr)
-    doc.db_set("jofotara_status", "Sent")
-    return out
+
+    # اختياري: حفظ الرد الخام في جدولة Logs (Child Table) لو أضفتها لاحقًا
+    # أو احفظه في Communication:
+    comm = frappe.get_doc({
+        "doctype": "Communication",
+        "communication_type": "Automated Message",
+        "subject": f"JoFatora Submit • {doc.name}",
+        "content": f"<pre>{frappe.as_json(resp, indent=2)}</pre>",
+        "reference_doctype": "Sales Invoice",
+        "reference_name": doc.name,
+    })
+    comm.insert(ignore_permissions=True)
 
 @frappe.whitelist()
-def cancel_invoice(name: str, reason: str = ""):
-    doc = frappe.get_doc("Sales Invoice", name)
-    settings = _get_settings()
-    headers = auth_headers(settings)
-    payload = {"invoiceNumber": doc.name, "uuid": doc.get("jofotara_uuid"), "reason": reason}
-    resp = post(settings, settings.cancel_url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        frappe.throw(_("JoFotara cancel failed: {0}").format(resp.text))
-    return resp.json()
-
-@frappe.whitelist()
-def query_status(name: str):
-    doc = frappe.get_doc("Sales Invoice", name)
-    settings = _get_settings()
-    headers = auth_headers(settings)
-    payload = {"invoiceNumber": doc.name, "uuid": doc.get("jofotara_uuid")}
-    resp = post(settings, settings.query_url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        frappe.throw(_("JoFotara query failed: {0}").format(resp.text))
-    return resp.json()
-
-def on_submit_send(doc, method=None):
-    try:
-        settings = _get_settings()
-    except Exception:
-        return
-    if not settings or not cint(settings.send_on_submit):
-        return
-    try:
-        send_invoice(doc.name)
-    except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "JoFotara on_submit_send failed")
-        try:
-            doc.db_set("jofotara_status", "Failed")
-        except Exception:
-            pass
+def retry_pending_jobs():
+    """مثال: تعيد محاولة أي فواتير حالتها Pending (لو اعتمدت هذا السيناريو)"""
+    # هنا ممكن تدور على فواتير Pending وترسلها من جديد
+    pass
