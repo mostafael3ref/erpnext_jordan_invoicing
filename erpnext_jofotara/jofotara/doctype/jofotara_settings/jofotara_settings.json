@@ -1,6 +1,6 @@
 {
   "name": "JoFotara Settings",
-  "module": "ERPNext JoFotara",
+  "module": "jofotara",
   "doctype": "DocType",
   "custom": 0,
   "istable": 0,
