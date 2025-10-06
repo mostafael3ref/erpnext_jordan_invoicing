@@ -1,0 +1,4 @@
+include erpnext_jofotara/modules.txt
+recursive-include erpnext_jofotara *
+recursive-exclude * __pycache__
+global-exclude *.pyc
