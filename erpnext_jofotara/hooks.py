@@ -7,17 +7,28 @@ app_description = "Integration with Jordan JoFotara"
 app_email = "dev@example.com"
 app_license = "MIT"
 
-# Include DocType JavaScript if needed later
-doctype_js = {}
+# مهم: يضمن وجود ERPNext قبل تثبيت الاب (يتفادى أخطاء Sales Invoice)
+required_apps = ["erpnext"]
 
-# Fixtures: none (we’ll create custom fields in install.py)
+# لا نستخدم Fixtures الآن لتفادي كسر التثبيت؛ بننشئ الحقول في after_migrate
 fixtures = []
 
-# Doc Events: auto-send on submit (configurable; check setting inside handler)
+# JS لاحقًا إن احتجت
+doctype_js = {}
+
+# إرسال تلقائي عند اعتماد الفاتورة (لو مفعّل في الإعدادات داخل الدالة)
 doc_events = {
     "Sales Invoice": {
         "on_submit": "erpnext_jofotara.api.invoices.on_submit_send"
     }
 }
 
-after_install = "erpnext_jofotara.install.after_install"
+# الأفضل بعد الهجرة بدل after_install
+after_migrate = ["erpnext_jofotara.install.after_migrate"]
+
+# (اختياري) جدول مهام لإعادة المحاولة أو مزامنة دورية
+scheduler_events = {
+    "hourly": [
+        "erpnext_jofotara.api.invoices.retry_pending_jobs"
+    ]
+}
