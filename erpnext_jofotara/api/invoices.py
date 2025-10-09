@@ -39,38 +39,38 @@ def _mask_headers(h: dict) -> dict:
     return masked
 
 
-def _build_headers(s) -> dict:
-    """
-    بناء الهيدر طبقًا لتوثيق JoFotara (بدون OAuth).
-    - لو Client-ID/Secret فاضيين، نستخدم Device User/Secret.
-    - إضافة Activity Number تحت المفتاح Key.
-    """
-    client_id = (getattr(s, "client_id", "") or getattr(s, "device_user", "") or "").strip()
-    secret    = (getattr(s, "secret_key", "") or getattr(s, "device_secret", "") or "").strip()
-    headers = {
+def _build_headers(s):
+    """Build JoFotra headers with proper secret extraction + fallback."""
+    # اقرأ الحقول
+    client_id = (s.client_id or "").strip()
+    client_secret = (s.get_password("secret_key") or "").strip()   # مهم: Password
+
+    device_user = (s.device_user or "").strip()
+    device_secret = (s.get_password("device_secret") or "").strip()  # مهم: Password
+
+    # لو مفيش Client/Secret استخدم الـ Device
+    if not client_id and device_user:
+        client_id = device_user
+    if not client_secret and device_secret:
+        client_secret = device_secret
+
+    h = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "Accept-Language": "ar",
         "Client-Id": client_id,
-        "Secret-Key": secret,
+        "Secret-Key": client_secret,
+        "Accept-Language": "ar",
     }
-    act = (getattr(s, "activity_number", "") or "").strip()
-    if act:
-        headers["Key"] = act
-    return headers
 
+    # رقم النشاط لازم يروح كـ Key (وبنضيف بدائل احتياطية)
+    key = (s.activity_number or "").strip()
+    if key:
+        h["Key"] = key
+        h["Activity-Number"] = key
+        h["ActivityNumber"] = key
 
-def _fmt(v) -> str:
-    """تهيئة رقم بمرتين عشريتين كـ نص (متوافق مع UBL)."""
-    return f"{Decimal(v or 0):.2f}"
+    return h
 
-
-def _uom_code(uom: str | None) -> str:
-    """
-    كود وحدة القياس في UBL (UN/ECE Rec 20).
-    لو مش معروف، نستعمل C62 (Each).
-    """
-    return "C62"
 
 
 # =========================
