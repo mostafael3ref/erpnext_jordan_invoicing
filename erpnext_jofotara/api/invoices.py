@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import base64
+import re
 from decimal import Decimal
 from urllib.parse import urljoin
 
 import requests
 import frappe
 from frappe import _
-
-# نتأكد من وجود الحقول المخصصة على Sales Invoice قبل أي db_set
 from erpnext_jofotara.install import ensure_custom_fields
 
 
@@ -18,19 +17,16 @@ from erpnext_jofotara.install import ensure_custom_fields
 # =========================
 
 def _full_url(base: str, path: str) -> str:
-    """ضم Base + Path بشكل آمن."""
     if (path or "").startswith("http"):
         return path
     return urljoin((base or "").rstrip("/") + "/", (path or "").lstrip("/"))
 
 
 def _get_settings():
-    """جلب DocType الإعدادات."""
     return frappe.get_single("JoFotara Settings")
 
 
 def _mask_headers(h: dict) -> dict:
-    """إخفاء القيم الحساسة قبل التسجيل في Error Log."""
     masked = dict(h or {})
     for k in ("Secret-Key", "Authorization"):
         if k in masked and masked[k]:
@@ -39,21 +35,19 @@ def _mask_headers(h: dict) -> dict:
 
 
 def _build_headers(s):
-    """Build JoFotra headers with proper secret extraction + fallback."""
     # نقرأ القيم من الإعدادات
     client_id     = (s.client_id or "").strip()
-    client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()   # <-- مهم
+    client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
 
     device_user   = (s.device_user or "").strip()
-    device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()  # <-- مهم
+    device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
-    # لو مفيش Client/Secret استخدم الـ Device
+    # fallback من Device لو Client فاضي
     if not client_id and device_user:
         client_id = device_user
     if not client_secret and device_secret:
         client_secret = device_secret
 
-    # لو لسه ناقصين نبين رسالة واضحة
     if not client_id or not client_secret:
         frappe.throw(_("JoFotara Settings is missing credentials. "
                        "Fill either Client ID/Secret (OAuth2) or Device User/Secret."))
@@ -75,9 +69,7 @@ def _build_headers(s):
     return headers
 
 
-
 def _fmt(n: float | Decimal, places: int = 3) -> str:
-    """تنسيق أرقام بثلاث منازل عشرية افتراضيًا (1 -> 1.000)."""
     try:
         return f"{float(n):.{places}f}"
     except Exception:
@@ -85,29 +77,18 @@ def _fmt(n: float | Decimal, places: int = 3) -> str:
 
 
 def _uom_code(uom: str | None) -> str:
-    """تحويل الـ UOM لكود UN/ECE. لو غير معروف نرجّع C62 (Unit)."""
     if not uom:
         return "C62"
     key = (uom or "").strip().lower()
-
     mapping = {
-        # وحدات عامة
         "unit": "C62", "units": "C62", "each": "C62", "pcs": "C62", "piece": "C62",
         "nos": "C62", "وحدة": "C62", "قطعة": "C62",
-
-        # وزن
         "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
         "g": "GRM", "gram": "GRM",
-
-        # حجم
         "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
         "ml": "MLT",
-
-        # طول
         "m": "MTR", "meter": "MTR", "متر": "MTR",
         "cm": "CMT", "mm": "MMT",
-
-        # زمن
         "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
         "day": "DAY", "يوم": "DAY",
         "month": "MON", "شهر": "MON",
@@ -116,15 +97,26 @@ def _uom_code(uom: str | None) -> str:
     return mapping.get(key, "C62")
 
 
+def _minify_xml(xml_str: str) -> str:
+    """
+    Minify XML: إزالة الأسطر الجديدة والفراغات بين التاجات فقط (بدون لمس الفراغات داخل النصوص).
+    الهدف تلبية شرط 'Invoice Minification' عند JoFotara.
+    """
+    if not xml_str:
+        return xml_str
+    s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
+    # اشطب أي مسافات بين >   < بحيث تبقى >< فقط
+    s = re.sub(r">\s+<", "><", s)
+    # إزالة BOM لو موجود
+    s = s.replace("\ufeff", "")
+    return s
+
+
 # =========================
 # UBL 2.1 (مبسّط لكنه صحيح بنيويًا)
 # =========================
 
 def generate_ubl_xml(doc) -> str:
-    """
-    توليد UBL 2.1 صالح بنيويًا.
-    ملاحظة: قد تحتاج إضافة عناصر حسب متطلبات JoFotara النهائية.
-    """
     cur = doc.currency or "JOD"
     issue_date = str(doc.posting_date)
 
@@ -149,7 +141,7 @@ def generate_ubl_xml(doc) -> str:
     if tax_rate <= 0 and net > 0 and tax_amt > 0:
         tax_rate = (tax_amt / net) * 100.0
     if tax_rate <= 0:
-        tax_rate = 16.0  # افتراضي
+        tax_rate = 16.0
 
     # سطور الفاتورة
     lines_xml = []
@@ -250,43 +242,32 @@ def generate_ubl_xml(doc) -> str:
 # =========================
 
 def on_submit_send(doc, method=None):
-    """
-    يُستدعى تلقائيًا عند اعتماد Sales Invoice (من hooks.py)
-    - يقرأ الإعدادات
-    - يولّد/يقرأ UBL XML
-    - يرسل POST إلى JoFotara
-    - يحدّث الحقول ويسجّل الرد
-    """
     s = _get_settings()
 
-    # احترام الإعداد
     if not s.get("send_on_submit"):
         return
-
-    # عدم إرسال المرتجع
     if getattr(doc, "is_return", 0):
         return
 
     try:
         ensure_custom_fields()
 
-        # لو عندك حقل jofotara_xml استخدمه وإلا ولّد XML مبسّط
         xml_str = getattr(doc, "jofotara_xml", None) or generate_ubl_xml(doc)
         if not xml_str:
             frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
 
+        # **هنا المنِيفاي**
+        xml_min = _minify_xml(xml_str)
+
         # Base64
-        xml_bytes = xml_str.encode("utf-8")
+        xml_bytes = xml_min.encode("utf-8")
         payload = {"invoice": base64.b64encode(xml_bytes).decode()}
 
-        # Endpoint + Headers
         url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
         headers = _build_headers(s)
 
-        # Call
         r = requests.post(url, json=payload, headers=headers, timeout=90)
 
-        # HTTP errors
         if r.status_code >= 400:
             detail = r.text
             try:
@@ -306,14 +287,9 @@ def on_submit_send(doc, method=None):
             )
             raise frappe.ValidationError(_("JoFotara API error {0}. See Error Log for details.").format(r.status_code))
 
-        # Parse response
-        if r.headers.get("content-type", "").startswith("application/json"):
-            resp = r.json()
-        else:
-            resp = {"raw": r.text}
+        resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
 
         handle_submit_response(doc, resp)
-
         frappe.msgprint(_("JoFotara: Invoice submitted successfully"), alert=1, indicator="green")
 
     except Exception:
@@ -325,25 +301,16 @@ def on_submit_send(doc, method=None):
 
 
 # =========================
-# معالجة الرد وتحديث الحقول
+# معالجة الرد
 # =========================
 
 def handle_submit_response(doc, resp: dict):
-    """تحديث الحقول حسب رد JoFotara + تسجيل الرد كتعليق."""
     ensure_custom_fields()
 
-    uuid = (
-        (resp or {}).get("uuid")
-        or (resp or {}).get("invoiceUUID")
-        or (resp or {}).get("invoice_uuid")
-        or (resp or {}).get("id")
-    )
-    qr = (
-        (resp or {}).get("qr")
-        or (resp or {}).get("qrCode")
-        or (resp or {}).get("qr_code")
-        or (resp or {}).get("qrcode")
-    )
+    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or
+            (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
+    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or
+          (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
 
     blob = frappe.as_json(resp) if isinstance(resp, (dict, list)) else str(resp or "")
     status = "Submitted" if (uuid or qr or "success" in blob.lower()) else "Error"
@@ -362,10 +329,9 @@ def handle_submit_response(doc, resp: dict):
 
 
 # =========================
-# (اختياري) إعادة محاولة لاحقًا
+# (اختياري) إعادة محاولة
 # =========================
 
 @frappe.whitelist()
 def retry_pending_jobs():
-    """مكان لمنطق إعادة الإرسال لو اعتمدت حالة Pending مستقبلًا."""
     pass
