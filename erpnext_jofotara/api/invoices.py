@@ -12,24 +12,21 @@ from frappe import _
 from erpnext_jofotara.install import ensure_custom_fields
 
 
-# =========================
+# ---------------------------
 # Helpers
-# =========================
+# ---------------------------
 
 def _full_url(base: str, path: str) -> str:
-    """Join base + path safely."""
     if (path or "").startswith("http"):
         return path
     return urljoin((base or "").rstrip("/") + "/", (path or "").lstrip("/"))
 
 
 def _get_settings():
-    """Fetch single settings doctype."""
     return frappe.get_single("JoFotara Settings")
 
 
 def _mask_headers(h: dict) -> dict:
-    """Mask sensitive headers before logging."""
     masked = dict(h or {})
     for k in ("Secret-Key", "Authorization"):
         if k in masked and masked[k]:
@@ -38,17 +35,12 @@ def _mask_headers(h: dict) -> dict:
 
 
 def _build_headers(s):
-    """
-    Build headers.
-    Falls back to Device User/Secret if Client ID/Secret are empty.
-    """
+    # credentials (with device fallback)
     client_id     = (s.client_id or "").strip()
     client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
-
     device_user   = (s.device_user or "").strip()
     device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
-    # Fallback
     if not client_id and device_user:
         client_id = device_user
     if not client_secret and device_secret:
@@ -70,13 +62,12 @@ def _build_headers(s):
     if key:
         headers["Key"] = key
         headers["Activity-Number"] = key
-        headers["ActivityNumber"]  = key
+        headers["ActivityNumber"] = key
 
     return headers
 
 
 def _fmt(n: float | Decimal, places: int = 3) -> str:
-    """Format numbers with fixed decimals."""
     try:
         return f"{float(n):.{places}f}"
     except Exception:
@@ -84,24 +75,18 @@ def _fmt(n: float | Decimal, places: int = 3) -> str:
 
 
 def _uom_code(uom: str | None) -> str:
-    """Map common UOMs to UN/ECE codes (default C62)."""
     if not uom:
         return "C62"
     key = (uom or "").strip().lower()
     mapping = {
-        # General
         "unit": "C62", "units": "C62", "each": "C62", "pcs": "C62", "piece": "C62",
         "nos": "C62", "وحدة": "C62", "قطعة": "C62",
-        # Weight
         "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
         "g": "GRM", "gram": "GRM",
-        # Volume
         "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
         "ml": "MLT",
-        # Length
         "m": "MTR", "meter": "MTR", "متر": "MTR",
         "cm": "CMT", "mm": "MMT",
-        # Time
         "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
         "day": "DAY", "يوم": "DAY",
         "month": "MON", "شهر": "MON",
@@ -111,35 +96,38 @@ def _uom_code(uom: str | None) -> str:
 
 
 def _minify_xml(xml_str: str) -> str:
-    """
-    Minify XML: remove newlines/tabs and spaces between tags only.
-    Helps satisfy "Invoice Minification" requirement.
-    """
+    """Minify XML safely (keep text spaces, remove formatting)."""
     if not xml_str:
         return xml_str
     s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
-    s = re.sub(r">\s+<", "><", s)  # collapse >   <  ->  ><
-    s = s.replace("\ufeff", "")    # strip BOM if any
+    s = re.sub(r">\s+<", "><", s)
+    s = s.replace("\ufeff", "")
     return s
 
 
-# =========================
-# UBL 2.1 (structurally valid)
-# =========================
+# ---------------------------
+# UBL 2.1 generator (structurally valid)
+# ---------------------------
+
+def _invoice_type_code(doc) -> str:
+    """388 = Tax Invoice, 381 = Credit Note, 383 = Debit Note."""
+    if getattr(doc, "is_return", 0):
+        return "381"
+    if getattr(doc, "is_debit_note", 0):
+        return "383"
+    return "388"
+
 
 def generate_ubl_xml(doc) -> str:
     cur = doc.currency or "JOD"
     issue_date = str(doc.posting_date)
-
-    # 388 = Invoice, 381 = Credit Note
-    type_code = "381" if getattr(doc, "is_return", 0) else "388"
 
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
     supplier_tax  = doc.company_tax_id or ""
     customer_name = doc.customer_name or doc.customer
     customer_tax  = doc.tax_id or ""
 
-    # Tax rate detection
+    # tax rate
     tax_rate = 0.0
     if getattr(doc, "taxes", None):
         for tx in doc.taxes:
@@ -151,13 +139,14 @@ def generate_ubl_xml(doc) -> str:
     net     = float(doc.net_total or doc.total or 0)
     gt      = float(doc.grand_total or 0)
 
-    # Infer rate from amounts if Actual without percentage
     if tax_rate <= 0 and net > 0 and tax_amt > 0:
         tax_rate = (tax_amt / net) * 100.0
     if tax_rate <= 0:
         tax_rate = 16.0
 
-    # Lines
+    inv_code = _invoice_type_code(doc)
+
+    # lines
     lines_xml = []
     for idx, it in enumerate(doc.items, start=1):
         qty  = float(it.qty or 1)
@@ -188,6 +177,7 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(lines_xml)
 
+    # IMPORTANT: add list attributes to InvoiceTypeCode
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
          xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -198,7 +188,7 @@ def generate_ubl_xml(doc) -> str:
 
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
-  <cbc:InvoiceTypeCode listID="UNCL1001">{type_code}</cbc:InvoiceTypeCode>
+  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -251,17 +241,15 @@ def generate_ubl_xml(doc) -> str:
 </Invoice>"""
 
 
-# =========================
+# ---------------------------
 # Hook: send on submit
-# =========================
+# ---------------------------
 
 def on_submit_send(doc, method=None):
     s = _get_settings()
-
     if not s.get("send_on_submit"):
         return
     if getattr(doc, "is_return", 0):
-        # لو حاب تبعت الإشعارات للمرتجع كمان، اشطب السطر ده
         return
 
     try:
@@ -271,13 +259,10 @@ def on_submit_send(doc, method=None):
         if not xml_str:
             frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
 
-        # Minify before Base64
+        # Minify to satisfy "Invoice Minification"
         xml_min = _minify_xml(xml_str)
 
-        # Base64 payload
-        xml_bytes = xml_min.encode("utf-8")
-        payload = {"invoice": base64.b64encode(xml_bytes).decode()}
-
+        payload = {"invoice": base64.b64encode(xml_min.encode("utf-8")).decode()}
         url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
         headers = _build_headers(s)
 
@@ -289,7 +274,6 @@ def on_submit_send(doc, method=None):
                 detail = frappe.as_json(r.json(), indent=2)
             except Exception:
                 pass
-
             frappe.log_error(
                 message=(
                     f"URL: {url}\n"
@@ -303,7 +287,6 @@ def on_submit_send(doc, method=None):
             raise frappe.ValidationError(_("JoFotara API error {0}. See Error Log for details.").format(r.status_code))
 
         resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
-
         handle_submit_response(doc, resp)
         frappe.msgprint(_("JoFotara: Invoice submitted successfully"), alert=1, indicator="green")
 
@@ -315,9 +298,9 @@ def on_submit_send(doc, method=None):
         raise
 
 
-# =========================
-# Handle response
-# =========================
+# ---------------------------
+# Response handling
+# ---------------------------
 
 def handle_submit_response(doc, resp: dict):
     ensure_custom_fields()
@@ -343,9 +326,9 @@ def handle_submit_response(doc, resp: dict):
         pass
 
 
-# =========================
-# (optional) retry
-# =========================
+# ---------------------------
+# Retry hook (optional)
+# ---------------------------
 
 @frappe.whitelist()
 def retry_pending_jobs():
