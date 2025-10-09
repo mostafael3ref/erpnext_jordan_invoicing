@@ -192,6 +192,7 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(lines_xml)
 
+    # ملاحظة: تم تبسيط InvoiceTypeCode وإحضاره قبل ID/IssueDate
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
          xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -201,10 +202,9 @@ def generate_ubl_xml(doc) -> str:
   <cbc:ProfileID>reporting:1.0</cbc:ProfileID>
   <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>
 
+  <cbc:InvoiceTypeCode>{inv_code}</cbc:InvoiceTypeCode>
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
-
-  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyName="UN/CEFACT" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -283,6 +283,17 @@ def on_submit_send(doc, method=None):
         url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
         headers = _build_headers(s)
 
+        # DEBUG: لوج لأول 800 حرف من الـ XML عند تفعيل developer_mode
+        if frappe.conf.get("developer_mode"):
+            try:
+                sample = xml_min[:800]
+                frappe.log_error(
+                    message=f"Outgoing UBL (first 800 chars):\n{sample}",
+                    title="JoFotara DEBUG - Outgoing XML"
+                )
+            except Exception:
+                pass
+
         r = requests.post(url, json=payload, headers=headers, timeout=90)
 
         if r.status_code >= 400:
@@ -324,8 +335,10 @@ def on_submit_send(doc, method=None):
 def handle_submit_response(doc, resp: dict):
     ensure_custom_fields()
 
-    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
-    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
+    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or
+            (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
+    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or
+          (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
 
     blob = frappe.as_json(resp) if isinstance(resp, (dict, list)) else str(resp or "")
     status = "Submitted" if (uuid or qr or "success" in blob.lower()) else "Error"
