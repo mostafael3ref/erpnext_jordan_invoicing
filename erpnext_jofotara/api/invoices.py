@@ -11,10 +11,9 @@ import frappe
 from frappe import _
 from erpnext_jofotara.install import ensure_custom_fields
 
-
-# ---------------------------
+# =========================
 # Helpers
-# ---------------------------
+# =========================
 
 def _full_url(base: str, path: str) -> str:
     if (path or "").startswith("http"):
@@ -32,8 +31,10 @@ def _mask_headers(h: dict) -> dict:
     return masked
 
 def _build_headers(s):
+    # نقرأ القيم من الإعدادات
     client_id     = (s.client_id or "").strip()
     client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
+
     device_user   = (s.device_user or "").strip()
     device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
@@ -59,7 +60,7 @@ def _build_headers(s):
     if key:
         headers["Key"] = key
         headers["Activity-Number"] = key
-        headers["ActivityNumber"] = key
+        headers["ActivityNumber"]  = key
 
     return headers
 
@@ -74,14 +75,19 @@ def _uom_code(uom: str | None) -> str:
         return "C62"
     key = (uom or "").strip().lower()
     mapping = {
+        # عامة
         "unit": "C62", "units": "C62", "each": "C62", "pcs": "C62", "piece": "C62",
         "nos": "C62", "وحدة": "C62", "قطعة": "C62",
+        # وزن
         "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
         "g": "GRM", "gram": "GRM",
+        # حجم
         "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
         "ml": "MLT",
+        # طول
         "m": "MTR", "meter": "MTR", "متر": "MTR",
         "cm": "CMT", "mm": "MMT",
+        # زمن
         "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
         "day": "DAY", "يوم": "DAY",
         "month": "MON", "شهر": "MON",
@@ -90,26 +96,20 @@ def _uom_code(uom: str | None) -> str:
     return mapping.get(key, "C62")
 
 def _minify_xml(xml_str: str) -> str:
-    """Minify XML safely (keep text spaces, remove formatting)."""
+    """
+    Minify XML: إزالة الأسطر الجديدة والفراغات بين التاجات فقط (بدون لمس الفراغات داخل النصوص).
+    لمعالجة خطأ Invalid Invoice Minification.
+    """
     if not xml_str:
         return xml_str
     s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
-    s = re.sub(r">\s+<", "><", s)
-    s = s.replace("\ufeff", "")
+    s = re.sub(r">\s+<", "><", s)  # ..><..
+    s = s.replace("\ufeff", "")    # إزالة BOM إن وجدت
     return s
 
-
-# ---------------------------
-# UBL 2.1 generator
-# ---------------------------
-
-def _invoice_type_code(doc) -> str:
-    """388 = Tax Invoice, 381 = Credit Note, 383 = Debit Note."""
-    if getattr(doc, "is_return", 0):
-        return "381"
-    if getattr(doc, "is_debit_note", 0):
-        return "383"
-    return "388"
+# =========================
+# UBL 2.1 (صحيح بنيويًا)
+# =========================
 
 def generate_ubl_xml(doc) -> str:
     cur = doc.currency or "JOD"
@@ -120,7 +120,7 @@ def generate_ubl_xml(doc) -> str:
     customer_name = doc.customer_name or doc.customer
     customer_tax  = doc.tax_id or ""
 
-    # tax rate
+    # استنتاج معدل الضريبة
     tax_rate = 0.0
     if getattr(doc, "taxes", None):
         for tx in doc.taxes:
@@ -132,14 +132,13 @@ def generate_ubl_xml(doc) -> str:
     net     = float(doc.net_total or doc.total or 0)
     gt      = float(doc.grand_total or 0)
 
+    # لو الضريبة Actual بدون نسبة: استنتجها من المبالغ
     if tax_rate <= 0 and net > 0 and tax_amt > 0:
         tax_rate = (tax_amt / net) * 100.0
     if tax_rate <= 0:
         tax_rate = 16.0
 
-    inv_code = _invoice_type_code(doc)
-
-    # lines
+    # سطور الفاتورة
     lines_xml = []
     for idx, it in enumerate(doc.items, start=1):
         qty  = float(it.qty or 1)
@@ -170,8 +169,7 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(lines_xml)
 
-    # NOTE: ضع InvoiceTypeCode قبل ID (بعض البوابات تتوقعه مبكرًا)،
-    # وأضف خصائص القائمة المعتمدة.
+    # NOTE: ترتيب العناصر هنا مطابق لتسلسل UBL 2.1 (الجذر)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
          xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -179,11 +177,13 @@ def generate_ubl_xml(doc) -> str:
   <cbc:UBLVersionID>2.1</cbc:UBLVersionID>
   <cbc:CustomizationID>urn:jo:jofotara:ubl:invoice</cbc:CustomizationID>
   <cbc:ProfileID>reporting:1.0</cbc:ProfileID>
+  <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>
 
-  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listAgencyName="UNECE"
-                       listName="Document name code" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
+
+  <!-- بعض البوابات تشترط خصائص الكود -->
+  <cbc:InvoiceTypeCode listID="UNCL1001" name="Invoice type">388</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -235,13 +235,13 @@ def generate_ubl_xml(doc) -> str:
   {lines_xml}
 </Invoice>"""
 
-
-# ---------------------------
-# Hook: send on submit
-# ---------------------------
+# =========================
+# Hook: إرسال عند الاعتماد
+# =========================
 
 def on_submit_send(doc, method=None):
     s = _get_settings()
+
     if not s.get("send_on_submit"):
         return
     if getattr(doc, "is_return", 0):
@@ -254,28 +254,25 @@ def on_submit_send(doc, method=None):
         if not xml_str:
             frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
 
-        # Minify to satisfy "Invoice Minification"
+        # منِيفاي لتفادي Invalid-Invoice-MINIFICATION
         xml_min = _minify_xml(xml_str)
 
-        payload = {"invoice": base64.b64encode(xml_min.encode("utf-8")).decode()}
+        # Base64
+        xml_bytes = xml_min.encode("utf-8")
+        payload = {"invoice": base64.b64encode(xml_bytes).decode()}
+
         url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
         headers = _build_headers(s)
 
         r = requests.post(url, json=payload, headers=headers, timeout=90)
 
         if r.status_code >= 400:
-            # أرفق الـ XML المرسل للمراجعة السريعة
-            try:
-                fname = f"jofotara_payload_{doc.name}.xml"
-                doc.add_attachment(fname, xml_min.encode("utf-8"), is_private=1)
-            except Exception:
-                pass
-
             detail = r.text
             try:
                 detail = frappe.as_json(r.json(), indent=2)
             except Exception:
                 pass
+
             frappe.log_error(
                 message=(
                     f"URL: {url}\n"
@@ -289,6 +286,7 @@ def on_submit_send(doc, method=None):
             raise frappe.ValidationError(_("JoFotara API error {0}. See Error Log for details.").format(r.status_code))
 
         resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
+
         handle_submit_response(doc, resp)
         frappe.msgprint(_("JoFotara: Invoice submitted successfully"), alert=1, indicator="green")
 
@@ -299,10 +297,9 @@ def on_submit_send(doc, method=None):
         frappe.log_error(frappe.get_traceback(), "JoFotara Submit Error")
         raise
 
-
-# ---------------------------
-# Response handling
-# ---------------------------
+# =========================
+# معالجة الرد
+# =========================
 
 def handle_submit_response(doc, resp: dict):
     ensure_custom_fields()
@@ -327,10 +324,9 @@ def handle_submit_response(doc, resp: dict):
     except Exception:
         pass
 
-
-# ---------------------------
-# Retry (optional)
-# ---------------------------
+# =========================
+# (اختياري) إعادة محاولة
+# =========================
 
 @frappe.whitelist()
 def retry_pending_jobs():
