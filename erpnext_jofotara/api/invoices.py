@@ -17,16 +17,19 @@ from erpnext_jofotara.install import ensure_custom_fields
 # =========================
 
 def _full_url(base: str, path: str) -> str:
+    """Join base + path safely."""
     if (path or "").startswith("http"):
         return path
     return urljoin((base or "").rstrip("/") + "/", (path or "").lstrip("/"))
 
 
 def _get_settings():
+    """Fetch single settings doctype."""
     return frappe.get_single("JoFotara Settings")
 
 
 def _mask_headers(h: dict) -> dict:
+    """Mask sensitive headers before logging."""
     masked = dict(h or {})
     for k in ("Secret-Key", "Authorization"):
         if k in masked and masked[k]:
@@ -35,14 +38,17 @@ def _mask_headers(h: dict) -> dict:
 
 
 def _build_headers(s):
-    # نقرأ القيم من الإعدادات
+    """
+    Build headers.
+    Falls back to Device User/Secret if Client ID/Secret are empty.
+    """
     client_id     = (s.client_id or "").strip()
     client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
 
     device_user   = (s.device_user or "").strip()
     device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
-    # fallback من Device لو Client فاضي
+    # Fallback
     if not client_id and device_user:
         client_id = device_user
     if not client_secret and device_secret:
@@ -70,6 +76,7 @@ def _build_headers(s):
 
 
 def _fmt(n: float | Decimal, places: int = 3) -> str:
+    """Format numbers with fixed decimals."""
     try:
         return f"{float(n):.{places}f}"
     except Exception:
@@ -77,18 +84,24 @@ def _fmt(n: float | Decimal, places: int = 3) -> str:
 
 
 def _uom_code(uom: str | None) -> str:
+    """Map common UOMs to UN/ECE codes (default C62)."""
     if not uom:
         return "C62"
     key = (uom or "").strip().lower()
     mapping = {
+        # General
         "unit": "C62", "units": "C62", "each": "C62", "pcs": "C62", "piece": "C62",
         "nos": "C62", "وحدة": "C62", "قطعة": "C62",
+        # Weight
         "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
         "g": "GRM", "gram": "GRM",
+        # Volume
         "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
         "ml": "MLT",
+        # Length
         "m": "MTR", "meter": "MTR", "متر": "MTR",
         "cm": "CMT", "mm": "MMT",
+        # Time
         "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
         "day": "DAY", "يوم": "DAY",
         "month": "MON", "شهر": "MON",
@@ -99,33 +112,34 @@ def _uom_code(uom: str | None) -> str:
 
 def _minify_xml(xml_str: str) -> str:
     """
-    Minify XML: إزالة الأسطر الجديدة والفراغات بين التاجات فقط (بدون لمس الفراغات داخل النصوص).
-    الهدف تلبية شرط 'Invoice Minification' عند JoFotara.
+    Minify XML: remove newlines/tabs and spaces between tags only.
+    Helps satisfy "Invoice Minification" requirement.
     """
     if not xml_str:
         return xml_str
     s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
-    # اشطب أي مسافات بين >   < بحيث تبقى >< فقط
-    s = re.sub(r">\s+<", "><", s)
-    # إزالة BOM لو موجود
-    s = s.replace("\ufeff", "")
+    s = re.sub(r">\s+<", "><", s)  # collapse >   <  ->  ><
+    s = s.replace("\ufeff", "")    # strip BOM if any
     return s
 
 
 # =========================
-# UBL 2.1 (مبسّط لكنه صحيح بنيويًا)
+# UBL 2.1 (structurally valid)
 # =========================
 
 def generate_ubl_xml(doc) -> str:
     cur = doc.currency or "JOD"
     issue_date = str(doc.posting_date)
 
+    # 388 = Invoice, 381 = Credit Note
+    type_code = "381" if getattr(doc, "is_return", 0) else "388"
+
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
     supplier_tax  = doc.company_tax_id or ""
     customer_name = doc.customer_name or doc.customer
     customer_tax  = doc.tax_id or ""
 
-    # استنتاج معدل الضريبة
+    # Tax rate detection
     tax_rate = 0.0
     if getattr(doc, "taxes", None):
         for tx in doc.taxes:
@@ -137,13 +151,13 @@ def generate_ubl_xml(doc) -> str:
     net     = float(doc.net_total or doc.total or 0)
     gt      = float(doc.grand_total or 0)
 
-    # لو الضريبة Actual بدون نسبة: استنتجها من المبالغ
+    # Infer rate from amounts if Actual without percentage
     if tax_rate <= 0 and net > 0 and tax_amt > 0:
         tax_rate = (tax_amt / net) * 100.0
     if tax_rate <= 0:
         tax_rate = 16.0
 
-    # سطور الفاتورة
+    # Lines
     lines_xml = []
     for idx, it in enumerate(doc.items, start=1):
         qty  = float(it.qty or 1)
@@ -184,7 +198,7 @@ def generate_ubl_xml(doc) -> str:
 
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
-  <cbc:InvoiceTypeCode>388</cbc:InvoiceTypeCode>
+  <cbc:InvoiceTypeCode listID="UNCL1001">{type_code}</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -238,7 +252,7 @@ def generate_ubl_xml(doc) -> str:
 
 
 # =========================
-# Hook: إرسال عند الاعتماد
+# Hook: send on submit
 # =========================
 
 def on_submit_send(doc, method=None):
@@ -247,6 +261,7 @@ def on_submit_send(doc, method=None):
     if not s.get("send_on_submit"):
         return
     if getattr(doc, "is_return", 0):
+        # لو حاب تبعت الإشعارات للمرتجع كمان، اشطب السطر ده
         return
 
     try:
@@ -256,10 +271,10 @@ def on_submit_send(doc, method=None):
         if not xml_str:
             frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
 
-        # **هنا المنِيفاي**
+        # Minify before Base64
         xml_min = _minify_xml(xml_str)
 
-        # Base64
+        # Base64 payload
         xml_bytes = xml_min.encode("utf-8")
         payload = {"invoice": base64.b64encode(xml_bytes).decode()}
 
@@ -301,7 +316,7 @@ def on_submit_send(doc, method=None):
 
 
 # =========================
-# معالجة الرد
+# Handle response
 # =========================
 
 def handle_submit_response(doc, resp: dict):
@@ -329,7 +344,7 @@ def handle_submit_response(doc, resp: dict):
 
 
 # =========================
-# (اختياري) إعادة محاولة
+# (optional) retry
 # =========================
 
 @frappe.whitelist()
