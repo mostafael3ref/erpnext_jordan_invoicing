@@ -71,7 +71,43 @@ def _build_headers(s):
 
     return h
 
+def _fmt(n: float | Decimal, places: int = 3) -> str:
+    """تنسيق أرقام بثلاث منازل عشرية افتراضيًا (1 -> 1.000)."""
+    try:
+        return f"{float(n):.{places}f}"
+    except Exception:
+        return f"{0:.{places}f}"
 
+def _uom_code(uom: str | None) -> str:
+    """تحويل الـ UOM لكود UN/ECE. لو غير معروف نرجّع C62 (Unit)."""
+    if not uom:
+        return "C62"
+    key = (uom or "").strip().lower()
+
+    mapping = {
+        # وحدات عامة
+        "unit": "C62", "units": "C62", "each": "C62", "pcs": "C62", "piece": "C62",
+        "nos": "C62", "وحدة": "C62", "قطعة": "C62",
+
+        # وزن
+        "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
+        "g": "GRM", "gram": "GRM",
+
+        # حجم
+        "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
+        "ml": "MLT",
+
+        # طول
+        "m": "MTR", "meter": "MTR", "متر": "MTR",
+        "cm": "CMT", "mm": "MMT",
+
+        # زمن
+        "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
+        "day": "DAY", "يوم": "DAY",
+        "month": "MON", "شهر": "MON",
+        "year": "ANN", "سنة": "ANN",
+    }
+    return mapping.get(key, "C62")
 
 # =========================
 # UBL 2.1 (مبسّط لكنه صحيح بنيويًا)
