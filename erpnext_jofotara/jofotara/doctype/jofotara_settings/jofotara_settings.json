@@ -22,11 +22,11 @@
     {"label": "Device User (Alt Auth)","fieldname": "device_user","fieldtype": "Data","depends_on": "eval:doc.use_oauth2!=1"},
     {"label": "Device Secret (Alt Auth)","fieldname": "device_secret","fieldtype": "Password","depends_on": "eval:doc.use_oauth2!=1"},
 
-    {"label": "Base URL","fieldname": "base_url","fieldtype": "Data","options": "URL","default": "https://portal.jofotara.gov.jo"},
+    {"label": "Base URL","fieldname": "base_url","fieldtype": "Data","options": "URL","default": "https://backend.jofotara.gov.jo"},
     {"label": "Token URL","fieldname": "token_url","fieldtype": "Data","default": "/connect/token"},
-    {"label": "Submit URL","fieldname": "submit_url","fieldtype": "Data","default": "/api/v1/invoices"},
-    {"label": "Cancel URL","fieldname": "cancel_url","fieldtype": "Data","default": "/api/v1/invoices/cancel"},
-    {"label": "Query URL","fieldname": "query_url","fieldtype": "Data","default": "/api/v1/invoices/status"},
+    {"label": "Submit URL","fieldname": "submit_url","fieldtype": "Data","default": "/core/invoices/"},
+    {"label": "Cancel URL","fieldname": "cancel_url","fieldtype": "Data","default": "/core/invoices/cancel"},
+    {"label": "Query URL","fieldname": "query_url","fieldtype": "Data","default": "/core/invoices/status"},
 
     {"label": "Payload Format","fieldname": "payload_format","fieldtype": "Select","options": "XML_UPL_2_1\nJSON","default": "XML_UPL_2_1"},
     {"label": "Sandbox Mode","fieldname": "sandbox_mode","fieldtype": "Check","default": "0"}
