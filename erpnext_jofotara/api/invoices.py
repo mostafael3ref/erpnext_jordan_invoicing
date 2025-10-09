@@ -1,5 +1,4 @@
 # erpnext_jofotara/api/invoices.py
-
 from __future__ import annotations
 
 import base64
@@ -40,13 +39,13 @@ def _mask_headers(h: dict) -> dict:
 
 
 def _build_headers(s):
-    """Build JoFotra headers with proper secret extraction + fallback."""
+    """Build JoFotara headers with proper secret extraction + fallback."""
     # اقرأ الحقول
     client_id = (s.client_id or "").strip()
-    client_secret = (s.get_password("secret_key") or "").strip()   # مهم: Password
+    client_secret = (s.get_password("secret_key") or "").strip()   # Password field
 
     device_user = (s.device_user or "").strip()
-    device_secret = (s.get_password("device_secret") or "").strip()  # مهم: Password
+    device_secret = (s.get_password("device_secret") or "").strip()  # Password field
 
     # لو مفيش Client/Secret استخدم الـ Device
     if not client_id and device_user:
@@ -71,12 +70,14 @@ def _build_headers(s):
 
     return h
 
+
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     """تنسيق أرقام بثلاث منازل عشرية افتراضيًا (1 -> 1.000)."""
     try:
         return f"{float(n):.{places}f}"
     except Exception:
         return f"{0:.{places}f}"
+
 
 def _uom_code(uom: str | None) -> str:
     """تحويل الـ UOM لكود UN/ECE. لو غير معروف نرجّع C62 (Unit)."""
@@ -109,6 +110,7 @@ def _uom_code(uom: str | None) -> str:
     }
     return mapping.get(key, "C62")
 
+
 # =========================
 # UBL 2.1 (مبسّط لكنه صحيح بنيويًا)
 # =========================
@@ -126,19 +128,23 @@ def generate_ubl_xml(doc) -> str:
     customer_name = doc.customer_name or doc.customer
     customer_tax  = doc.tax_id or ""
 
-    # استنتاج معدل الضريبة (نأخذ أول ضريبة موجبة، وإلا 16%)
+    # استنتاج معدل الضريبة
     tax_rate = 0.0
     if getattr(doc, "taxes", None):
         for tx in doc.taxes:
             if (tx.rate or 0) > 0:
                 tax_rate = float(tx.rate or 0)
                 break
-    if tax_rate <= 0:
-        tax_rate = 16.0
 
     tax_amt = float(doc.total_taxes_and_charges or 0)
     net     = float(doc.net_total or doc.total or 0)
     gt      = float(doc.grand_total or 0)
+
+    # لو الضريبة Actual بدون نسبة: استنتجها من المبالغ
+    if tax_rate <= 0 and net > 0 and tax_amt > 0:
+        tax_rate = (tax_amt / net) * 100.0
+    if tax_rate <= 0:
+        tax_rate = 16.0  # افتراضي
 
     # سطور الفاتورة
     lines_xml = []
@@ -277,7 +283,6 @@ def on_submit_send(doc, method=None):
 
         # HTTP errors
         if r.status_code >= 400:
-            # حاول تفسر الرد JSON لو موجود
             detail = r.text
             try:
                 detail = frappe.as_json(r.json(), indent=2)
@@ -311,7 +316,6 @@ def on_submit_send(doc, method=None):
         if doc.meta.has_field("jofotara_status"):
             doc.db_set("jofotara_status", "Error")
         frappe.log_error(frappe.get_traceback(), "JoFotara Submit Error")
-        # ارمي نفس الخطأ للواجهة
         raise
 
 
@@ -323,7 +327,6 @@ def handle_submit_response(doc, resp: dict):
     """تحديث الحقول حسب رد JoFotara + تسجيل الرد كتعليق."""
     ensure_custom_fields()
 
-    # محاولة لالتقاط UUID و QR من مفاتيح شائعة
     uuid = (
         (resp or {}).get("uuid")
         or (resp or {}).get("invoiceUUID")
@@ -345,14 +348,11 @@ def handle_submit_response(doc, resp: dict):
     if uuid and doc.meta.has_field("jofotara_uuid"):
         doc.db_set("jofotara_uuid", uuid)
     if qr and doc.meta.has_field("jofotara_qr"):
-        # لو الـ API بيرجع Base64 PNG هنقدر نطبعه مباشرة في Print Format
         doc.db_set("jofotara_qr", qr)
 
-    # سجل الرد للمرجعية
     try:
         doc.add_comment("Comment", text=frappe.as_json(resp, indent=2))
     except Exception:
-        # في بعض الحالات (خاصة بعد on_submit) قد يفشل add_comment؛ نتجاهلها
         pass
 
 
