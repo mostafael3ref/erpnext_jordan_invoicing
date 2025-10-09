@@ -21,10 +21,8 @@ def _full_url(base: str, path: str) -> str:
         return path
     return urljoin((base or "").rstrip("/") + "/", (path or "").lstrip("/"))
 
-
 def _get_settings():
     return frappe.get_single("JoFotara Settings")
-
 
 def _mask_headers(h: dict) -> dict:
     masked = dict(h or {})
@@ -33,14 +31,13 @@ def _mask_headers(h: dict) -> dict:
             masked[k] = "********"
     return masked
 
-
 def _build_headers(s):
-    # credentials (with device fallback)
     client_id     = (s.client_id or "").strip()
     client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
     device_user   = (s.device_user or "").strip()
     device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
+    # fallback من Device لو Client فاضي
     if not client_id and device_user:
         client_id = device_user
     if not client_secret and device_secret:
@@ -66,13 +63,11 @@ def _build_headers(s):
 
     return headers
 
-
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
         return f"{float(n):.{places}f}"
     except Exception:
         return f"{0:.{places}f}"
-
 
 def _uom_code(uom: str | None) -> str:
     if not uom:
@@ -94,7 +89,6 @@ def _uom_code(uom: str | None) -> str:
     }
     return mapping.get(key, "C62")
 
-
 def _minify_xml(xml_str: str) -> str:
     """Minify XML safely (keep text spaces, remove formatting)."""
     if not xml_str:
@@ -106,7 +100,7 @@ def _minify_xml(xml_str: str) -> str:
 
 
 # ---------------------------
-# UBL 2.1 generator (structurally valid)
+# UBL 2.1 generator
 # ---------------------------
 
 def _invoice_type_code(doc) -> str:
@@ -116,7 +110,6 @@ def _invoice_type_code(doc) -> str:
     if getattr(doc, "is_debit_note", 0):
         return "383"
     return "388"
-
 
 def generate_ubl_xml(doc) -> str:
     cur = doc.currency or "JOD"
@@ -177,7 +170,8 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(lines_xml)
 
-    # IMPORTANT: add list attributes to InvoiceTypeCode
+    # NOTE: ضع InvoiceTypeCode قبل ID (بعض البوابات تتوقعه مبكرًا)،
+    # وأضف خصائص القائمة المعتمدة.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
          xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -186,9 +180,10 @@ def generate_ubl_xml(doc) -> str:
   <cbc:CustomizationID>urn:jo:jofotara:ubl:invoice</cbc:CustomizationID>
   <cbc:ProfileID>reporting:1.0</cbc:ProfileID>
 
+  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listAgencyName="UNECE"
+                       listName="Document name code" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
-  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -269,6 +264,13 @@ def on_submit_send(doc, method=None):
         r = requests.post(url, json=payload, headers=headers, timeout=90)
 
         if r.status_code >= 400:
+            # أرفق الـ XML المرسل للمراجعة السريعة
+            try:
+                fname = f"jofotara_payload_{doc.name}.xml"
+                doc.add_attachment(fname, xml_min.encode("utf-8"), is_private=1)
+            except Exception:
+                pass
+
             detail = r.text
             try:
                 detail = frappe.as_json(r.json(), indent=2)
@@ -327,7 +329,7 @@ def handle_submit_response(doc, resp: dict):
 
 
 # ---------------------------
-# Retry hook (optional)
+# Retry (optional)
 # ---------------------------
 
 @frappe.whitelist()
