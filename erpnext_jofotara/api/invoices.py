@@ -39,13 +39,13 @@ def _mask_headers(h: dict) -> dict:
 
 
 def _build_headers(s):
-    """Build JoFotara headers with proper secret extraction + fallback."""
-    # اقرأ الحقول
-    client_id = (s.client_id or "").strip()
-    client_secret = (s.get_password("secret_key") or "").strip()   # Password field
+    """Build JoFotra headers with proper secret extraction + fallback."""
+    # نقرأ القيم من الإعدادات
+    client_id     = (s.client_id or "").strip()
+    client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()   # <-- مهم
 
-    device_user = (s.device_user or "").strip()
-    device_secret = (s.get_password("device_secret") or "").strip()  # Password field
+    device_user   = (s.device_user or "").strip()
+    device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()  # <-- مهم
 
     # لو مفيش Client/Secret استخدم الـ Device
     if not client_id and device_user:
@@ -53,7 +53,12 @@ def _build_headers(s):
     if not client_secret and device_secret:
         client_secret = device_secret
 
-    h = {
+    # لو لسه ناقصين نبين رسالة واضحة
+    if not client_id or not client_secret:
+        frappe.throw(_("JoFotara Settings is missing credentials. "
+                       "Fill either Client ID/Secret (OAuth2) or Device User/Secret."))
+
+    headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Client-Id": client_id,
@@ -61,14 +66,14 @@ def _build_headers(s):
         "Accept-Language": "ar",
     }
 
-    # رقم النشاط لازم يروح كـ Key (وبنضيف بدائل احتياطية)
     key = (s.activity_number or "").strip()
     if key:
-        h["Key"] = key
-        h["Activity-Number"] = key
-        h["ActivityNumber"] = key
+        headers["Key"] = key
+        headers["Activity-Number"] = key
+        headers["ActivityNumber"]  = key
 
-    return h
+    return headers
+
 
 
 def _fmt(n: float | Decimal, places: int = 3) -> str:
