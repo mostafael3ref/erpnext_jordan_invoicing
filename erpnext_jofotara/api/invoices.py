@@ -11,6 +11,7 @@ import frappe
 from frappe import _
 from erpnext_jofotara.install import ensure_custom_fields
 
+
 # =========================
 # Helpers
 # =========================
@@ -20,8 +21,10 @@ def _full_url(base: str, path: str) -> str:
         return path
     return urljoin((base or "").rstrip("/") + "/", (path or "").lstrip("/"))
 
+
 def _get_settings():
     return frappe.get_single("JoFotara Settings")
+
 
 def _mask_headers(h: dict) -> dict:
     masked = dict(h or {})
@@ -30,12 +33,13 @@ def _mask_headers(h: dict) -> dict:
             masked[k] = "********"
     return masked
 
+
 def _build_headers(s):
     # نقرأ القيم من الإعدادات
-    client_id     = (s.client_id or "").strip()
+    client_id = (s.client_id or "").strip()
     client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
 
-    device_user   = (s.device_user or "").strip()
+    device_user = (s.device_user or "").strip()
     device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
     # fallback من Device لو Client فاضي
@@ -45,8 +49,9 @@ def _build_headers(s):
         client_secret = device_secret
 
     if not client_id or not client_secret:
-        frappe.throw(_("JoFotara Settings is missing credentials. "
-                       "Fill either Client ID/Secret (OAuth2) or Device User/Secret."))
+        frappe.throw(
+            _("JoFotara Settings is missing credentials. Fill either Client ID/Secret or Device User/Secret.")
+        )
 
     headers = {
         "Content-Type": "application/json",
@@ -60,9 +65,10 @@ def _build_headers(s):
     if key:
         headers["Key"] = key
         headers["Activity-Number"] = key
-        headers["ActivityNumber"]  = key
+        headers["ActivityNumber"] = key
 
     return headers
+
 
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
@@ -70,42 +76,57 @@ def _fmt(n: float | Decimal, places: int = 3) -> str:
     except Exception:
         return f"{0:.{places}f}"
 
+
 def _uom_code(uom: str | None) -> str:
     if not uom:
         return "C62"
     key = (uom or "").strip().lower()
     mapping = {
-        # عامة
-        "unit": "C62", "units": "C62", "each": "C62", "pcs": "C62", "piece": "C62",
-        "nos": "C62", "وحدة": "C62", "قطعة": "C62",
-        # وزن
-        "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
-        "g": "GRM", "gram": "GRM",
-        # حجم
-        "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
+        "unit": "C62",
+        "units": "C62",
+        "each": "C62",
+        "pcs": "C62",
+        "piece": "C62",
+        "nos": "C62",
+        "وحدة": "C62",
+        "قطعة": "C62",
+        "kg": "KGM",
+        "kilogram": "KGM",
+        "كيلو": "KGM",
+        "g": "GRM",
+        "gram": "GRM",
+        "l": "LTR",
+        "lt": "LTR",
+        "liter": "LTR",
+        "لتر": "LTR",
         "ml": "MLT",
-        # طول
-        "m": "MTR", "meter": "MTR", "متر": "MTR",
-        "cm": "CMT", "mm": "MMT",
-        # زمن
-        "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
-        "day": "DAY", "يوم": "DAY",
-        "month": "MON", "شهر": "MON",
-        "year": "ANN", "سنة": "ANN",
+        "m": "MTR",
+        "meter": "MTR",
+        "متر": "MTR",
+        "cm": "CMT",
+        "mm": "MMT",
+        "hour": "HUR",
+        "hr": "HUR",
+        "ساعة": "HUR",
+        "day": "DAY",
+        "يوم": "DAY",
+        "month": "MON",
+        "شهر": "MON",
+        "year": "ANN",
+        "سنة": "ANN",
     }
     return mapping.get(key, "C62")
 
+
 def _minify_xml(xml_str: str) -> str:
-    """
-    Minify XML: إزالة الأسطر الجديدة والفراغات بين التاجات فقط (بدون لمس الفراغات داخل النصوص).
-    لمعالجة خطأ Invalid Invoice Minification.
-    """
+    """Minify XML لتفادي خطأ Invalid-Invoice-MINIFICATION"""
     if not xml_str:
         return xml_str
     s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
-    s = re.sub(r">\s+<", "><", s)  # ..><..
-    s = s.replace("\ufeff", "")    # إزالة BOM إن وجدت
+    s = re.sub(r">\s+<", "><", s)
+    s = s.replace("\ufeff", "")
     return s
+
 
 # =========================
 # UBL 2.1 (صحيح بنيويًا)
@@ -116,9 +137,9 @@ def generate_ubl_xml(doc) -> str:
     issue_date = str(doc.posting_date)
 
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
-    supplier_tax  = doc.company_tax_id or ""
+    supplier_tax = doc.company_tax_id or ""
     customer_name = doc.customer_name or doc.customer
-    customer_tax  = doc.tax_id or ""
+    customer_tax = doc.tax_id or ""
 
     # استنتاج معدل الضريبة
     tax_rate = 0.0
@@ -129,22 +150,24 @@ def generate_ubl_xml(doc) -> str:
                 break
 
     tax_amt = float(doc.total_taxes_and_charges or 0)
-    net     = float(doc.net_total or doc.total or 0)
-    gt      = float(doc.grand_total or 0)
+    net = float(doc.net_total or doc.total or 0)
+    gt = float(doc.grand_total or 0)
 
-    # لو الضريبة Actual بدون نسبة: استنتجها من المبالغ
     if tax_rate <= 0 and net > 0 and tax_amt > 0:
         tax_rate = (tax_amt / net) * 100.0
     if tax_rate <= 0:
         tax_rate = 16.0
 
+    # كود نوع الفاتورة (388 = عادية، 381 = مرتجع)
+    inv_code = "381" if getattr(doc, "is_return", 0) else "388"
+
     # سطور الفاتورة
     lines_xml = []
     for idx, it in enumerate(doc.items, start=1):
-        qty  = float(it.qty or 1)
+        qty = float(it.qty or 1)
         rate = float(it.rate or 0)
-        ext  = float(it.amount or (qty * rate))
-        uom  = _uom_code(getattr(it, "uom", None))
+        ext = float(it.amount or (qty * rate))
+        uom = _uom_code(getattr(it, "uom", None))
         name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
 
         line = f"""
@@ -169,7 +192,6 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(lines_xml)
 
-    # NOTE: ترتيب العناصر هنا مطابق لتسلسل UBL 2.1 (الجذر)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
          xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -182,8 +204,7 @@ def generate_ubl_xml(doc) -> str:
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
 
-  <!-- بعض البوابات تشترط خصائص الكود -->
-  <cbc:InvoiceTypeCode listID="UNCL1001" name="Invoice type">388</cbc:InvoiceTypeCode>
+  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyName="UN/CEFACT" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -235,6 +256,7 @@ def generate_ubl_xml(doc) -> str:
   {lines_xml}
 </Invoice>"""
 
+
 # =========================
 # Hook: إرسال عند الاعتماد
 # =========================
@@ -254,10 +276,7 @@ def on_submit_send(doc, method=None):
         if not xml_str:
             frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
 
-        # منِيفاي لتفادي Invalid-Invoice-MINIFICATION
         xml_min = _minify_xml(xml_str)
-
-        # Base64
         xml_bytes = xml_min.encode("utf-8")
         payload = {"invoice": base64.b64encode(xml_bytes).decode()}
 
@@ -297,6 +316,7 @@ def on_submit_send(doc, method=None):
         frappe.log_error(frappe.get_traceback(), "JoFotara Submit Error")
         raise
 
+
 # =========================
 # معالجة الرد
 # =========================
@@ -304,10 +324,8 @@ def on_submit_send(doc, method=None):
 def handle_submit_response(doc, resp: dict):
     ensure_custom_fields()
 
-    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or
-            (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
-    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or
-          (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
+    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
+    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
 
     blob = frappe.as_json(resp) if isinstance(resp, (dict, list)) else str(resp or "")
     status = "Submitted" if (uuid or qr or "success" in blob.lower()) else "Error"
@@ -323,6 +341,7 @@ def handle_submit_response(doc, resp: dict):
         doc.add_comment("Comment", text=frappe.as_json(resp, indent=2))
     except Exception:
         pass
+
 
 # =========================
 # (اختياري) إعادة محاولة
