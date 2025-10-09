@@ -119,7 +119,7 @@ def _uom_code(uom: str | None) -> str:
 
 
 def _minify_xml(xml_str: str) -> str:
-    """Minify XML لتفادي خطأ Invalid-Invoice-MINIFICATION"""
+    """Minify XML لتفادي مشاكل مسافات/أسطر"""
     if not xml_str:
         return xml_str
     s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
@@ -192,7 +192,7 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(lines_xml)
 
-    # ملاحظة: تم تبسيط InvoiceTypeCode وإحضاره قبل ID/IssueDate
+    # ترتيب الرأس حسب UBL: ID -> IssueDate -> InvoiceTypeCode -> DocumentCurrencyCode
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
          xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -202,9 +202,9 @@ def generate_ubl_xml(doc) -> str:
   <cbc:ProfileID>reporting:1.0</cbc:ProfileID>
   <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>
 
-  <cbc:InvoiceTypeCode>{inv_code}</cbc:InvoiceTypeCode>
   <cbc:ID>{doc.name}</cbc:ID>
   <cbc:IssueDate>{issue_date}</cbc:IssueDate>
+  <cbc:InvoiceTypeCode>{inv_code}</cbc:InvoiceTypeCode>
   <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>
 
   <cac:AccountingSupplierParty>
@@ -318,48 +318,4 @@ def on_submit_send(doc, method=None):
         resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
 
         handle_submit_response(doc, resp)
-        frappe.msgprint(_("JoFotara: Invoice submitted successfully"), alert=1, indicator="green")
-
-    except Exception:
-        ensure_custom_fields()
-        if doc.meta.has_field("jofotara_status"):
-            doc.db_set("jofotara_status", "Error")
-        frappe.log_error(frappe.get_traceback(), "JoFotara Submit Error")
-        raise
-
-
-# =========================
-# معالجة الرد
-# =========================
-
-def handle_submit_response(doc, resp: dict):
-    ensure_custom_fields()
-
-    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or
-            (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
-    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or
-          (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
-
-    blob = frappe.as_json(resp) if isinstance(resp, (dict, list)) else str(resp or "")
-    status = "Submitted" if (uuid or qr or "success" in blob.lower()) else "Error"
-
-    if doc.meta.has_field("jofotara_status"):
-        doc.db_set("jofotara_status", status)
-    if uuid and doc.meta.has_field("jofotara_uuid"):
-        doc.db_set("jofotara_uuid", uuid)
-    if qr and doc.meta.has_field("jofotara_qr"):
-        doc.db_set("jofotara_qr", qr)
-
-    try:
-        doc.add_comment("Comment", text=frappe.as_json(resp, indent=2))
-    except Exception:
-        pass
-
-
-# =========================
-# (اختياري) إعادة محاولة
-# =========================
-
-@frappe.whitelist()
-def retry_pending_jobs():
-    pass
+        frappe.msgprint(_("JoFotara: Invoic_
