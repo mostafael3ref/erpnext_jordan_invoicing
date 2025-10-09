@@ -24,8 +24,30 @@ def _full_url(base: str, path: str) -> str:
 
 def _get_settings():
     """DocType الإعدادات"""
-    # اسم الدوكتايب عندك "JoFotara Settings"
     return frappe.get_single("JoFotara Settings")
+
+
+def _build_headers(s):
+    """
+    يبني الهيدرز المطلوبة من إعدادات JoFotara.
+    - يعتمد على التوثيق بالـ Headers (بدون OAuth2).
+    - يمرر Activity Number في مفتاح Key (واحتياطات إضافية).
+    """
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Client-Id": (s.client_id or "").strip(),
+        "Secret-Key": (s.secret_key or "").strip(),
+        "Accept-Language": "ar",
+    }
+    # رقم النشاط (Activity Number) غالبًا مطلوب في الهيدر باسم Key
+    if getattr(s, "activity_number", None):
+        val = s.activity_number.strip()
+        if val:
+            h["Key"] = val                 # الاسم الظاهر في الدليل
+            h["Activity-Number"] = val     # احتياطي
+            h["ActivityNumber"] = val      # احتياطي
+    return h
 
 
 # ---------------------------
@@ -35,7 +57,7 @@ def _get_settings():
 def generate_ubl_xml(doc) -> str:
     """
     يولّد UBL 2.1 مبسّط من الفاتورة.
-    ملاحظة: قد تحتاج إضافة عناصر حسب متطلبات JoFotara لاحقًا (تصنيف الضريبة، أكواد، ...إلخ).
+    ملاحظة: قد تحتاج إضافة عناصر حسب متطلبات JoFotara لاحقًا.
     """
     cur = doc.currency or "JOD"
     issue_date = str(doc.posting_date)
@@ -148,19 +170,31 @@ def on_submit_send(doc, method=None):
 
         # Endpoint + Headers
         url = _full_url(s.base_url, s.submit_url or "/core/invoices/")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Client-Id": s.client_id,
-            "Secret-Key": s.secret_key,
-            "Accept-Language": "ar",
-        }
+        headers = _build_headers(s)
 
         # Call
         r = requests.post(url, json=payload, headers=headers, timeout=90)
+
+        # أخطاء HTTP
         if r.status_code >= 400:
-            # رجّع رسالة واضحة من السيرفر
-            raise frappe.ValidationError(f"JoFotara API error {r.status_code}: {r.text}")
+            detail = r.text
+            try:
+                detail = frappe.as_json(r.json(), indent=2)
+            except Exception:
+                pass
+            frappe.log_error(
+                message=(
+                    f"URL: {url}\n"
+                    f"Status: {r.status_code}\n"
+                    f"Request Headers: {headers}\n"
+                    f"Request Payload keys: {list(payload.keys())}\n"
+                    f"Response Body:\n{detail}"
+                ),
+                title="JoFotara API Error",
+            )
+            raise frappe.ValidationError(
+                _("JoFotara API error {0}. See Error Log for details.").format(r.status_code)
+            )
 
         # JSON or raw
         if r.headers.get("content-type", "").startswith("application/json"):
