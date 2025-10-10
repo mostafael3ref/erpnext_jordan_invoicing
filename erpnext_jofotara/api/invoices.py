@@ -206,7 +206,7 @@ def generate_ubl_xml(doc) -> str:
         "    <cac:Party>",
         f"      <cac:PartyName><cbc:Name>{frappe.utils.escape_html(customer_name)}</cbc:Name></cac:PartyName>",
         "      <cac:PartyTaxScheme>",
-        f"        <cbc:CompanyID>{frappe utils.escape_html(customer_tax)}</cbc:CompanyID>",
+        f"        <cbc:CompanyID>{frappe.utils.escape_html(customer_tax)}</cbc:CompanyID>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:PartyTaxScheme>",
         "      <cac:PartyLegalEntity>",
