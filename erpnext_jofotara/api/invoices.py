@@ -137,8 +137,8 @@ def generate_ubl_xml(doc) -> str:
     if tax_rate <= 0:
         tax_rate = 16.0
 
-    # كود نوع الفاتورة (388 = فاتورة، 381 = إشعار دائن)
-    inv_code = "381" if getattr(doc, "is_return", 0) else "388"
+    # كود نوع الفاتورة (380 = فاتورة، 381 = إشعار دائن، 383 = إشعار مدين)
+    inv_code = "381" if getattr(doc, "is_return", 0) else "380"
 
     # سطور الفاتورة
     line_blocks: list[str] = []
@@ -186,7 +186,7 @@ def generate_ubl_xml(doc) -> str:
         "  <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>",
         f"  <cbc:ID>{doc.name}</cbc:ID>",
         f"  <cbc:IssueDate>{issue_date}</cbc:IssueDate>",
-        f'  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listAgencyName="UNECE" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
+        f'  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listAgencyName="UN/ECE" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
         f"  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>",
         "",
         "  <cac:AccountingSupplierParty>",
@@ -206,7 +206,7 @@ def generate_ubl_xml(doc) -> str:
         "    <cac:Party>",
         f"      <cac:PartyName><cbc:Name>{frappe.utils.escape_html(customer_name)}</cbc:Name></cac:PartyName>",
         "      <cac:PartyTaxScheme>",
-        f"        <cbc:CompanyID>{frappe.utils.escape_html(customer_tax)}</cbc:CompanyID>",
+        f"        <cbc:CompanyID>{frappe utils.escape_html(customer_tax)}</cbc:CompanyID>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:PartyTaxScheme>",
         "      <cac:PartyLegalEntity>",
