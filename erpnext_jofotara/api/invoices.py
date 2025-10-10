@@ -186,7 +186,7 @@ def generate_ubl_xml(doc) -> str:
         "  <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>",
         f"  <cbc:ID>{doc.name}</cbc:ID>",
         f"  <cbc:IssueDate>{issue_date}</cbc:IssueDate>",
-        f'  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listAgencyName="UN/ECE" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
+        f'  <cbc:InvoiceTypeCode listID="UNCL1001" listAgencyID="6" listAgencyName="United Nations Economic Commission for Europe" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
         f"  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>",
         "",
         "  <cac:AccountingSupplierParty>",
