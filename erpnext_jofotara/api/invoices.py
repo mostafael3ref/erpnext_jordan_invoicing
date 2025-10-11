@@ -196,7 +196,7 @@ def generate_ubl_xml_income(doc) -> str:
     invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
-    # 011 نقدي / 021 آجل (باستخدام الهيلبر)
+    # 011 نقدي / 021 آجل
     is_cash = _is_cash_invoice(doc)
     type_name = "011" if is_cash else "021"
 
@@ -366,16 +366,20 @@ def generate_ubl_xml_sales(doc) -> str:
     net_total = 0.0
     tax_total = 0.0
     grand_total = 0.0
+    total_item_discount = 0.0
     line_blocks = []
+
     for idx, it in enumerate(doc.items, start=1):
         qty = float(it.qty or 1)
         rate = float(it.rate or 0)
-        discount = float(getattr(it, "discount_amount", 0) or 0)
-        base = (qty * rate) - discount
+        line_disc = float(getattr(it, "discount_amount", 0) or 0)
+        base = (qty * rate) - line_disc
         tax_amt = base * (tax_rate / 100.0)
+
         net_total += base
         tax_total += tax_amt
         grand_total += (base + tax_amt)
+        total_item_discount += line_disc
 
         uom = _uom_code(getattr(it, "uom", None))
         name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
@@ -396,10 +400,20 @@ def generate_ubl_xml_sales(doc) -> str:
             "    <cac:Price>",
             f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(rate, 3)}</cbc:PriceAmount>',
             f'      <cbc:BaseQuantity unitCode="{uom}">{_fmt(1)}</cbc:BaseQuantity>',
+            "      <cac:AllowanceCharge>",
+            "        <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+            "        <cbc:AllowanceChargeReason>DISCOUNT</cbc:AllowanceChargeReason>",
+            f'        <cbc:Amount currencyID="{cur}">{_fmt(line_disc, 3)}</cbc:Amount>',
+            "      </cac:AllowanceCharge>",
             "    </cac:Price>",
             "  </cac:InvoiceLine>",
         ]))
+
     lines_xml = "\n".join(line_blocks)
+    allowance_total = max(total_item_discount, 0.0)
+
+    s = _get_settings()
+    activity_number = (getattr(s, "activity_number", None) or "").strip()
 
     parts = []
     parts += [
@@ -411,10 +425,14 @@ def generate_ubl_xml_sales(doc) -> str:
         f'  <cbc:ID>{invoice_id}</cbc:ID>',
         f'  <cbc:UUID>{uuid}</cbc:UUID>',
         f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        # الشكل المطلوب من JoFotara
         f'  <cbc:InvoiceTypeCode name="{type_name}">388</cbc:InvoiceTypeCode>',
         f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
+        f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
+        "  <cac:AdditionalDocumentReference>",
+        "    <cbc:ID>ICV</cbc:ID>",
+        f"    <cbc:UUID>{icv}</cbc:UUID>",
+        "  </cac:AdditionalDocumentReference>",
         "",
         # Seller
         "  <cac:AccountingSupplierParty>",
@@ -453,7 +471,21 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:Party>",
         "  </cac:AccountingCustomerParty>",
         "",
-        # ضريبة
+    ]
+    if activity_number:
+        parts += [
+            "  <cac:SellerSupplierParty>",
+            "    <cac:Party>",
+            "      <cac:PartyIdentification>",
+            f"        <cbc:ID>{frappe.utils.escape_html(activity_number)}</cbc:ID>",
+            "      </cac:PartyIdentification>",
+            "    </cac:Party>",
+            "  </cac:SellerSupplierParty>",
+            "",
+        ]
+
+    # الضريبة الإجمالية
+    parts += [
         "  <cac:TaxTotal>",
         f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
         "    <cac:TaxSubtotal>",
@@ -465,10 +497,25 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:TaxSubtotal>",
         "  </cac:TaxTotal>",
         "",
+    ]
+
+    if allowance_total > 0:
+        parts += [
+            "  <cac:AllowanceCharge>",
+            "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+            "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
+            f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
+            "  </cac:AllowanceCharge>",
+            "",
+        ]
+
+    # المجاميع المالية
+    parts += [
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
         f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
         f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
@@ -546,7 +593,6 @@ def on_submit_send(doc, method=None):
                 pass
 
         if need_retry_as_sales:
-            # أعد توليد XML كنموذج Sales وجرب مرة واحدة
             xml_sales = generate_ubl_xml_sales(doc)
             xml_min = _minify_xml(xml_sales)
             payload = {"invoice": base64.b64encode(xml_min.encode("utf-8")).decode()}
