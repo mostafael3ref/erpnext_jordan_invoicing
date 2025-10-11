@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 import re
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urljoin
 
 import requests
@@ -69,11 +69,21 @@ def _build_headers(s):
     return headers
 
 
+# تنسيق للعرض فقط
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
         return f"{float(n):.{places}f}"
     except Exception:
         return f"{0:.{places}f}"
+
+
+# تقفية/تجميع بالأرقام العشرية
+_Q = Decimal("0.001")
+def _q(x) -> Decimal:
+    try:
+        return (Decimal(str(x))).quantize(_Q, rounding=ROUND_HALF_UP)
+    except Exception:
+        return Decimal("0.000")
 
 
 def _uom_code(uom: str | None) -> str:
@@ -197,47 +207,43 @@ def generate_ubl_xml_income(doc) -> str:
     uuid, icv = _uuid_icv(doc)
 
     # 011 نقدي / 021 آجل
-    is_cash = _is_cash_invoice(doc)
-    type_name = "011" if is_cash else "021"
+    type_name = "011" if _is_cash_invoice(doc) else "021"
 
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
-    # احسب السطور والمجاميع
-    total_item_discount = 0.0
-    line_ext_total = 0.0
+    # السطور والمجاميع (Discount على مستوى السطر فقط)
     line_blocks = []
+    line_ext_total = Decimal("0.000")
     for idx, it in enumerate(doc.items, start=1):
-        qty = float(it.qty or 1)
-        unit_price = float(it.rate or 0)
-        line_discount = float(getattr(it, "discount_amount", 0) or 0)
-        net_line = (qty * unit_price) - line_discount
-        total_item_discount += line_discount
-        line_ext_total += net_line
+        qty = _q(it.qty or 1)
+        unit_price = _q(it.rate or 0)
+        line_discount = _q(getattr(it, "discount_amount", 0) or 0)
+        base = _q(qty * unit_price - line_discount)
+
+        line_ext_total += base
 
         uom = _uom_code(getattr(it, "uom", None))
         name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
-            f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty, 2)}</cbc:InvoicedQuantity>',
-            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_line, 3)}</cbc:LineExtensionAmount>',
+            f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty)}</cbc:InvoicedQuantity>',
+            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(base)}</cbc:LineExtensionAmount>',
             "    <cac:Item>",
             f"      <cbc:Name>{name}</cbc:Name>",
             "    </cac:Item>",
             "    <cac:Price>",
-            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(unit_price, 3)}</cbc:PriceAmount>',
+            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(unit_price)}</cbc:PriceAmount>',
             "      <cac:AllowanceCharge>",
             "        <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
             "        <cbc:AllowanceChargeReason>DISCOUNT</cbc:AllowanceChargeReason>",
-            f'        <cbc:Amount currencyID="{cur}">{_fmt(line_discount, 3)}</cbc:Amount>',
+            f'        <cbc:Amount currencyID="{cur}">{_fmt(line_discount)}</cbc:Amount>',
             "      </cac:AllowanceCharge>",
             "    </cac:Price>",
             "  </cac:InvoiceLine>",
         ]))
     lines_xml = "\n".join(line_blocks)
-    allowance_total = max(total_item_discount, 0.0)
-    income_sequence = (getattr(s, "activity_number", None) or "").strip()
 
     parts = []
     parts += [
@@ -302,6 +308,7 @@ def generate_ubl_xml_income(doc) -> str:
         "  </cac:AccountingCustomerParty>",
         "",
     ]
+    income_sequence = (getattr(s, "activity_number", None) or "").strip()
     if income_sequence:
         parts += [
             "  <cac:SellerSupplierParty>",
@@ -313,18 +320,15 @@ def generate_ubl_xml_income(doc) -> str:
             "  </cac:SellerSupplierParty>",
             "",
         ]
+
+    # لا AllowanceCharge على مستوى الهيدر
+
     parts += [
-        "  <cac:AllowanceCharge>",
-        "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
-        "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
-        f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
-        "  </cac:AllowanceCharge>",
         "  <cac:LegalMonetaryTotal>",
-        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:LineExtensionAmount>',
-        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxInclusiveAmount>',
-        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:PayableAmount>',
+        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total)}</cbc:LineExtensionAmount>',
+        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(line_ext_total)}</cbc:TaxExclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(line_ext_total)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(line_ext_total)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
@@ -346,40 +350,38 @@ def generate_ubl_xml_sales(doc) -> str:
     uuid, icv = _uuid_icv(doc)
 
     # نوع السداد: 011 نقدي / 021 آجل
-    is_cash = _is_cash_invoice(doc)
-    type_name = "011" if is_cash else "021"
+    type_name = "011" if _is_cash_invoice(doc) else "021"
 
     # استنتاج معدل الضريبة من Taxes أو 16%
-    tax_rate = 0.0
+    tax_rate = Decimal("0.000")
     if getattr(doc, "taxes", None):
         for tx in doc.taxes:
             if (tx.rate or 0) > 0:
-                tax_rate = float(tx.rate or 0)
+                tax_rate = _q(tx.rate or 0)
                 break
     if tax_rate <= 0:
-        tax_rate = 16.0
+        tax_rate = Decimal("16.000")
 
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
-    # السطور والمجاميع
-    net_total = 0.0
-    tax_total = 0.0
-    grand_total = 0.0
-    total_item_discount = 0.0
+    # السطور والمجاميع (Discount على مستوى السطر فقط)
     line_blocks = []
+    net_total = Decimal("0.000")
+    tax_total = Decimal("0.000")
+    grand_total = Decimal("0.000")
 
     for idx, it in enumerate(doc.items, start=1):
-        qty = float(it.qty or 1)
-        rate = float(it.rate or 0)
-        line_disc = float(getattr(it, "discount_amount", 0) or 0)
-        base = (qty * rate) - line_disc
-        tax_amt = base * (tax_rate / 100.0)
+        qty = _q(it.qty or 1)
+        rate = _q(it.rate or 0)
+        line_disc = _q(getattr(it, "discount_amount", 0) or 0)
+
+        base = _q(qty * rate - line_disc)      # صافي الأساس بعد خصم السطر
+        tax_amt = _q(base * (tax_rate / Decimal("100")))
 
         net_total += base
         tax_total += tax_amt
-        grand_total += (base + tax_amt)
-        total_item_discount += line_disc
+        grand_total += _q(base + tax_amt)
 
         uom = _uom_code(getattr(it, "uom", None))
         name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
@@ -387,8 +389,8 @@ def generate_ubl_xml_sales(doc) -> str:
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
-            f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty, 2)}</cbc:InvoicedQuantity>',
-            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(base, 3)}</cbc:LineExtensionAmount>',
+            f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty)}</cbc:InvoicedQuantity>',
+            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(base)}</cbc:LineExtensionAmount>',
             "    <cac:Item>",
             f"      <cbc:Name>{name}</cbc:Name>",
             "      <cac:ClassifiedTaxCategory>",
@@ -398,19 +400,18 @@ def generate_ubl_xml_sales(doc) -> str:
             "      </cac:ClassifiedTaxCategory>",
             "    </cac:Item>",
             "    <cac:Price>",
-            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(rate, 3)}</cbc:PriceAmount>',
+            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(rate)}</cbc:PriceAmount>',
             f'      <cbc:BaseQuantity unitCode="{uom}">{_fmt(1)}</cbc:BaseQuantity>',
             "      <cac:AllowanceCharge>",
             "        <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
             "        <cbc:AllowanceChargeReason>DISCOUNT</cbc:AllowanceChargeReason>",
-            f'        <cbc:Amount currencyID="{cur}">{_fmt(line_disc, 3)}</cbc:Amount>',
+            f'        <cbc:Amount currencyID="{cur}">{_fmt(line_disc)}</cbc:Amount>',
             "      </cac:AllowanceCharge>",
             "    </cac:Price>",
             "  </cac:InvoiceLine>",
         ]))
 
     lines_xml = "\n".join(line_blocks)
-    allowance_total = max(total_item_discount, 0.0)
 
     s = _get_settings()
     activity_number = (getattr(s, "activity_number", None) or "").strip()
@@ -487,10 +488,10 @@ def generate_ubl_xml_sales(doc) -> str:
     # الضريبة الإجمالية
     parts += [
         "  <cac:TaxTotal>",
-        f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
+        f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total)}</cbc:TaxAmount>',
         "    <cac:TaxSubtotal>",
-        f'      <cbc:TaxableAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxableAmount>',
-        f'      <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
+        f'      <cbc:TaxableAmount currencyID="{cur}">{_fmt(net_total)}</cbc:TaxableAmount>',
+        f'      <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total)}</cbc:TaxAmount>',
         "      <cac:TaxCategory>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:TaxCategory>",
@@ -499,24 +500,15 @@ def generate_ubl_xml_sales(doc) -> str:
         "",
     ]
 
-    if allowance_total > 0:
-        parts += [
-            "  <cac:AllowanceCharge>",
-            "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
-            "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
-            f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
-            "  </cac:AllowanceCharge>",
-            "",
-        ]
+    # لا AllowanceCharge على مستوى الهيدر
+    # لا ترسل AllowanceTotalAmount لأن الخصم طبقناه بالفعل على مستوى السطور
 
-    # المجاميع المالية
     parts += [
         "  <cac:LegalMonetaryTotal>",
-        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
-        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
-        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:PayableAmount>',
+        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total)}</cbc:LineExtensionAmount>',
+        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total)}</cbc:TaxExclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(grand_total)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
