@@ -113,11 +113,15 @@ def _minify_xml(xml_str: str) -> str:
 
 def _seller_info(doc):
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
-    # خذ من الفاتورة ثم من Company.tax_id
+
+    # خذ من الفاتورة -> من Company.tax_id -> من إعدادات JoFotara (seller_tax_number)
+    s = _get_settings()
     supplier_tax_raw = (
         (doc.company_tax_id or "")
         or (frappe.db.get_value("Company", doc.company, "tax_id") or "")
+        or ((getattr(s, "seller_tax_number", None) or ""))
     ).strip()
+
     supplier_tax = re.sub(r"\D", "", supplier_tax_raw)  # أرقام فقط
     if not (1 <= len(supplier_tax) <= 15):
         frappe.throw(_("Seller Tax Number is required (1-15 digits). Current: '{0}'").format(supplier_tax_raw))
