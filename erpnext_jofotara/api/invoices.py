@@ -69,37 +69,11 @@ def _build_headers(s):
     return headers
 
 
-def _fmt(n: float | Decimal | None, places: int = 3) -> str:
+def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
-        if n is None:
-            n = 0
         return f"{float(n):.{places}f}"
     except Exception:
         return f"{0:.{places}f}"
-
-
-def _s(v) -> str:
-    """String-safe: None -> '', else str(v) trimmed. بدون escape لو أرقام."""
-    if v is None:
-        return ""
-    try:
-        if isinstance(v, (int, float, Decimal)):
-            return str(v)
-        s = str(v)
-        return s.strip()
-    except Exception:
-        return ""
-
-
-def _xml(v) -> str:
-    """Escape XML-sensitive chars (&, <, >, ", ')."""
-    s = _s(v)
-    if not s:
-        return ""
-    # هام: الترتيب مهم (& أولاً)
-    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    s = s.replace('"', "&quot;").replace("'", "&apos;")
-    return s
 
 
 def _uom_code(uom: str | None) -> str:
@@ -124,28 +98,10 @@ def _uom_code(uom: str | None) -> str:
     return mapping.get(key, "PCE")
 
 
-def _strip_null_literals_from_xml(xml_str: str) -> str:
-    """تنظيف أي نص 'None' أو 'null' بين العناصر أو داخل الخصائص إلى قيمة فاضية."""
-    if not xml_str:
-        return xml_str
-    s = xml_str
-    # بين الوسوم
-    s = s.replace(">None<", "><").replace(">null<", "><").replace(">NULL<", "><")
-    # خصائص
-    s = re.sub(r'="None"', '=""', s)
-    s = re.sub(r"='None'", "=''", s)
-    s = re.sub(r'="null"', '=""', s, flags=re.I)
-    s = re.sub(r"='null'", "=''", flags=re.I, string=s)
-    # مسافات قبل الإغلاق
-    s = re.sub(r">\s+None\s+<", "><", s)
-    return s
-
-
 def _minify_xml(xml_str: str) -> str:
     if not xml_str:
         return xml_str
-    s = _strip_null_literals_from_xml(xml_str)
-    s = s.replace("\r", "").replace("\n", "").replace("\t", "").strip()
+    s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
     s = re.sub(r">\s+<", "><", s)
     s = s.replace("\ufeff", "")
     return s
@@ -156,7 +112,7 @@ def _minify_xml(xml_str: str) -> str:
 # =========================
 
 def _seller_info(doc):
-    supplier_name = _s(frappe.db.get_value("Company", doc.company, "company_name") or doc.company)
+    supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
 
     # خذ من الفاتورة -> من Company.tax_id -> من إعدادات JoFotara (seller_tax_number)
     s = _get_settings()
@@ -173,15 +129,15 @@ def _seller_info(doc):
 
 
 def _buyer_info(doc):
-    customer_name = _s(doc.customer_name or doc.customer)
-    buyer_phone = _s(getattr(doc, "contact_phone", None) or getattr(doc, "contact_mobile", None))
+    customer_name = (doc.customer_name or doc.customer or "").strip()
+    buyer_phone = (getattr(doc, "contact_phone", None) or getattr(doc, "contact_mobile", None) or "").strip()
     postal_code = ""
     try:
         if getattr(doc, "customer_address", None):
-            postal_code = _s(frappe.db.get_value("Address", doc.customer_address, "pincode") or "")
+            postal_code = frappe.db.get_value("Address", doc.customer_address, "pincode") or ""
     except Exception:
-        postal_code = ""
-    buyer_id = _s(getattr(doc, "tax_id", None))
+        pass
+    buyer_id = (doc.tax_id or "").strip()
     buyer_scheme = "TN" if buyer_id else ""  # غيّرها لـ NIN/PN إذا لزم
     return customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme
 
@@ -210,11 +166,11 @@ def _uuid_icv(doc):
 def generate_ubl_xml_income(doc) -> str:
     s = _get_settings()
 
-    cur = _s((doc.currency or "JOD")).upper()
-    issue_date = _s(doc.posting_date)
-    note = _xml(getattr(doc, "remarks", None) or getattr(doc, "po_no", None))
+    cur = (doc.currency or "JOD").upper()
+    issue_date = str(doc.posting_date)
+    note = (getattr(doc, "remarks", None) or getattr(doc, "po_no", None) or "").strip()
 
-    invoice_id = _xml(doc.name)
+    invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
     # 011 نقدي / 021 آجل
@@ -229,8 +185,7 @@ def generate_ubl_xml_income(doc) -> str:
     # احسب السطور والمجاميع
     total_item_discount = 0.0
     line_ext_total = 0.0
-    line_blocks = []
-    for idx, it in enumerate(doc.items, start=1):
+    for it in (doc.items or []):
         qty = float(it.qty or 1)
         unit_price = float(it.rate or 0)
         line_discount = float(getattr(it, "discount_amount", 0) or 0)
@@ -238,8 +193,18 @@ def generate_ubl_xml_income(doc) -> str:
         total_item_discount += line_discount
         line_ext_total += net_line
 
+    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
+    income_sequence = (getattr(s, "activity_number", None) or "").strip()
+
+    # سطور
+    line_blocks = []
+    for idx, it in enumerate(doc.items, start=1):
+        qty = float(it.qty or 1)
+        unit_price = float(it.rate or 0)
+        line_discount = float(getattr(it, "discount_amount", 0) or 0)
+        net_line = (qty * unit_price) - line_discount
         uom = _uom_code(getattr(it, "uom", None))
-        name = _xml(it.item_name or it.item_code or "Item")
+        name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
@@ -259,8 +224,10 @@ def generate_ubl_xml_income(doc) -> str:
             "  </cac:InvoiceLine>",
         ]))
     lines_xml = "\n".join(line_blocks)
-    allowance_total = max(total_item_discount, 0.0)
-    income_sequence = _s(getattr(s, "activity_number", None))
+
+    rounded_total = float(getattr(doc, "rounded_total", 0) or 0)
+    grand_total = float(getattr(doc, "grand_total", 0) or 0)
+    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or 0)
 
     parts = []
     parts += [
@@ -272,9 +239,8 @@ def generate_ubl_xml_income(doc) -> str:
         f'  <cbc:ID>{invoice_id}</cbc:ID>',
         f'  <cbc:UUID>{uuid}</cbc:UUID>',
         f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        # ✅ إصلاح البَج: استخدمنا type_name بدل القيمة الثابتة
         f'  <cbc:InvoiceTypeCode name="{type_name}">388</cbc:InvoiceTypeCode>',
-        f'  <cbc:Note>{note}</cbc:Note>',
+        f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
         f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
         "  <cac:AdditionalDocumentReference>",
@@ -289,11 +255,11 @@ def generate_ubl_xml_income(doc) -> str:
         "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
         "      </cac:PostalAddress>",
         "      <cac:PartyTaxScheme>",
-        f"        <cbc:CompanyID>{supplier_tax}</cbc:CompanyID>",
+        f"        <cbc:CompanyID>{frappe.utils.escape_html(supplier_tax)}</cbc:CompanyID>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:PartyTaxScheme>",
         "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{_xml(supplier_name)}</cbc:RegistrationName>",
+        f"        <cbc:RegistrationName>{frappe.utils.escape_html(supplier_name)}</cbc:RegistrationName>",
         "      </cac:PartyLegalEntity>",
         "    </cac:Party>",
         "  </cac:AccountingSupplierParty>",
@@ -305,23 +271,23 @@ def generate_ubl_xml_income(doc) -> str:
     if buyer_id:
         parts += [
             "      <cac:PartyIdentification>",
-            f'        <cbc:ID schemeID="{buyer_scheme}">{_xml(buyer_id)}</cbc:ID>',
+            f'        <cbc:ID schemeID="{buyer_scheme}">{frappe.utils.escape_html(buyer_id)}</cbc:ID>',
             "      </cac:PartyIdentification>",
         ]
     parts += [
         "      <cac:PostalAddress>",
-        f"        <cbc:PostalZone>{_xml(postal_code)}</cbc:PostalZone>",
+        f"        <cbc:PostalZone>{frappe.utils.escape_html(postal_code)}</cbc:PostalZone>",
         "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
         "      </cac:PostalAddress>",
         "      <cac:PartyTaxScheme>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:PartyTaxScheme>",
         "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{_xml(customer_name)}</cbc:RegistrationName>",
+        f"        <cbc:RegistrationName>{frappe.utils.escape_html(customer_name)}</cbc:RegistrationName>",
         "      </cac:PartyLegalEntity>",
         "    </cac:Party>",
         "    <cac:AccountingContact>",
-        f"      <cbc:Telephone>{_xml(buyer_phone)}</cbc:Telephone>",
+        f"      <cbc:Telephone>{frappe.utils.escape_html(buyer_phone)}</cbc:Telephone>",
         "    </cac:AccountingContact>",
         "  </cac:AccountingCustomerParty>",
         "",
@@ -331,7 +297,7 @@ def generate_ubl_xml_income(doc) -> str:
             "  <cac:SellerSupplierParty>",
             "    <cac:Party>",
             "      <cac:PartyIdentification>",
-            f"        <cbc:ID>{_xml(income_sequence)}</cbc:ID>",
+            f"        <cbc:ID>{frappe.utils.escape_html(income_sequence)}</cbc:ID>",
             "      </cac:PartyIdentification>",
             "    </cac:Party>",
             "  </cac:SellerSupplierParty>",
@@ -346,9 +312,11 @@ def generate_ubl_xml_income(doc) -> str:
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total or line_ext_total, 3)}</cbc:TaxInclusiveAmount>',
         f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:PayableAmount>',
+        # PayableRoundingAmount + PayableAmount = rounded_total
+        f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt((rounded_total or grand_total or line_ext_total), 3)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
@@ -362,11 +330,11 @@ def generate_ubl_xml_income(doc) -> str:
 # =========================
 
 def generate_ubl_xml_sales(doc) -> str:
-    cur = _s((doc.currency or "JOD")).upper()
-    issue_date = _s(doc.posting_date)
-    note = _xml(getattr(doc, "remarks", None))
+    cur = (doc.currency or "JOD").upper()
+    issue_date = str(doc.posting_date)
+    note = (getattr(doc, "remarks", None) or "").strip()
 
-    invoice_id = _xml(doc.name)
+    invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
     # 380 = Sales Invoice
@@ -386,22 +354,19 @@ def generate_ubl_xml_sales(doc) -> str:
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
     # السطور والمجاميع
-    net_total = 0.0
-    tax_total = 0.0
-    grand_total = 0.0
+    total_item_discount = 0.0
+    net_total_calc = 0.0
     line_blocks = []
     for idx, it in enumerate(doc.items, start=1):
         qty = float(it.qty or 1)
         rate = float(it.rate or 0)
         discount = float(getattr(it, "discount_amount", 0) or 0)
         base = (qty * rate) - discount
-        tax_amt = base * (tax_rate / 100.0)
-        net_total += base
-        tax_total += tax_amt
-        grand_total += (base + tax_amt)
+        total_item_discount += discount
+        net_total_calc += base
 
         uom = _uom_code(getattr(it, "uom", None))
-        name = _xml(it.item_name or it.item_code or "Item")
+        name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
 
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
@@ -424,6 +389,14 @@ def generate_ubl_xml_sales(doc) -> str:
         ]))
     lines_xml = "\n".join(line_blocks)
 
+    # استخدم أرقام ERP الفعلية عند توفرها
+    net_total = float(getattr(doc, "net_total", 0) or net_total_calc)
+    tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (net_total * tax_rate/100.0))
+    grand_total = float(getattr(doc, "grand_total", 0) or (net_total + tax_total))
+    rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
+    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
+    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
+
     parts = []
     parts += [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -435,18 +408,18 @@ def generate_ubl_xml_sales(doc) -> str:
         f'  <cbc:UUID>{uuid}</cbc:UUID>',
         f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
         f'  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
-        f'  <cbc:Note>{note}</cbc:Note>',
+        f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
         "",
         # Seller
         "  <cac:AccountingSupplierParty>",
         "    <cac:Party>",
         "      <cac:PartyTaxScheme>",
-        f"        <cbc:CompanyID>{supplier_tax}</cbc:CompanyID>",
+        f"        <cbc:CompanyID>{frappe.utils.escape_html(supplier_tax)}</cbc:CompanyID>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:PartyTaxScheme>",
         "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{_xml(supplier_name)}</cbc:RegistrationName>",
+        f"        <cbc:RegistrationName>{frappe.utils.escape_html(supplier_name)}</cbc:RegistrationName>",
         "      </cac:PartyLegalEntity>",
         "    </cac:Party>",
         "  </cac:AccountingSupplierParty>",
@@ -458,24 +431,24 @@ def generate_ubl_xml_sales(doc) -> str:
     if buyer_id:
         parts += [
             "      <cac:PartyIdentification>",
-            f'        <cbc:ID schemeID="{buyer_scheme}">{_xml(buyer_id)}</cbc:ID>',
+            f'        <cbc:ID schemeID="{buyer_scheme}">{frappe.utils.escape_html(buyer_id)}</cbc:ID>',
             "      </cac:PartyIdentification>",
         ]
     parts += [
         "      <cac:PostalAddress>",
-        f"        <cbc:PostalZone>{_xml(postal_code)}</cbc:PostalZone>",
+        f"        <cbc:PostalZone>{frappe.utils.escape_html(postal_code)}</cbc:PostalZone>",
         "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
         "      </cac:PostalAddress>",
         "      <cac:PartyTaxScheme>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
         "      </cac:PartyTaxScheme>",
         "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{_xml(customer_name)}</cbc:RegistrationName>",
+        f"        <cbc:RegistrationName>{frappe.utils.escape_html(customer_name)}</cbc:RegistrationName>",
         "      </cac:PartyLegalEntity>",
         "    </cac:Party>",
         "  </cac:AccountingCustomerParty>",
         "",
-        # ضريبة
+        # إجمالي الضريبة
         "  <cac:TaxTotal>",
         f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
         "    <cac:TaxSubtotal>",
@@ -487,11 +460,19 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:TaxSubtotal>",
         "  </cac:TaxTotal>",
         "",
+        # الخصومات + الإجماليات (مع التقريب)
+        "  <cac:AllowanceCharge>",
+        "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+        "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
+        f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
+        "  </cac:AllowanceCharge>",
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
         f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:PayableAmount>',
+        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
+        f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(rounded_total, 3)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
@@ -533,8 +514,7 @@ def on_submit_send(doc, method=None):
             xml_str = getattr(_doc, "jofotara_xml", None) or generate_ubl_xml(_doc)
             if not xml_str:
                 frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
-            # تنظيف أي None/null قبل التصغير والتشفير
-            xml_min = _minify_xml(_strip_null_literals_from_xml(xml_str))
+            xml_min = _minify_xml(xml_str)
             xml_bytes = xml_min.encode("utf-8")
             return {"payload": {"invoice": base64.b64encode(xml_bytes).decode()}, "xml_min": xml_min}
 
@@ -549,27 +529,22 @@ def on_submit_send(doc, method=None):
             except Exception:
                 pass
 
-        # الإرسال الأول
         r = requests.post(url, json=data["payload"], headers=headers, timeout=90)
 
-        # لو غير مصرّح لنوع الفاتورة، جرّب Sales مرة واحدة
+        # جرّب Sales تلقائياً لو رسالة عدم السماح بنوع الفاتورة
         need_retry_as_sales = False
         if r.status_code >= 400:
             try:
                 j = r.json()
-                msg = (frappe.as_json(j) or "").lower()
-                # توسيع معايير كشف الخطأ
-                if ("not authorized to submit this type of invoice" in msg
-                        or '"einv_code":"invoicetypecode"' in msg
-                        or "invoicetypecode" in msg):
+                msg = frappe.as_json(j)
+                if "not authorized to submit this type of invoice" in msg.lower():
                     need_retry_as_sales = True
             except Exception:
                 pass
 
         if need_retry_as_sales:
-            # أعد توليد XML كنموذج Sales وجرب مرة واحدة
             xml_sales = generate_ubl_xml_sales(doc)
-            xml_min = _minify_xml(_strip_null_literals_from_xml(xml_sales))
+            xml_min = _minify_xml(xml_sales)
             payload = {"invoice": base64.b64encode(xml_min.encode("utf-8")).decode()}
             r = requests.post(url, json=payload, headers=headers, timeout=90)
 
@@ -635,8 +610,4 @@ def handle_submit_response(doc, resp: dict):
 
 @frappe.whitelist()
 def retry_pending_jobs():
-    """
-    Placeholder: بإمكانك لاحقاً تجميعة المستندات اللي jofotara_status=Error
-    وإعادة استدعاء on_submit_send عليها.
-    """
     pass
