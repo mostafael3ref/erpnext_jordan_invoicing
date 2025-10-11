@@ -111,6 +111,29 @@ def _minify_xml(xml_str: str) -> str:
 # مشتركات
 # =========================
 
+def _is_cash_invoice(doc) -> bool:
+    """يحدد إن كانت الفاتورة نقدية 011 أو آجل 021."""
+    try:
+        paid = float(getattr(doc, "paid_amount", 0) or 0)
+        gt = float(getattr(doc, "grand_total", 0) or 0)
+        outstanding = float(getattr(doc, "outstanding_amount", (gt - paid)) or 0)
+    except Exception:
+        paid, gt, outstanding = 0.0, 0.0, 0.0
+
+    if getattr(doc, "is_pos", 0):
+        return True
+    if paid >= gt - 1e-3:
+        return True
+    if abs(outstanding) < 1e-3:
+        return True
+
+    for p in (getattr(doc, "payments", []) or []):
+        m = (getattr(p, "mode_of_payment", "") or "").strip().lower()
+        if m in ("cash", "bank", "card", "visa", "mastercard", "credit card", "debit card"):
+            return True
+    return False
+
+
 def _seller_info(doc):
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
 
@@ -173,10 +196,8 @@ def generate_ubl_xml_income(doc) -> str:
     invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
-    # 011 نقدي / 021 آجل
-    is_cash = bool(getattr(doc, "is_pos", 0)) or (
-        float(getattr(doc, "paid_amount", 0) or 0) >= float(getattr(doc, "grand_total", 0) or 0)
-    )
+    # 011 نقدي / 021 آجل (باستخدام الهيلبر)
+    is_cash = _is_cash_invoice(doc)
     type_name = "011" if is_cash else "021"
 
     supplier_name, supplier_tax = _seller_info(doc)
@@ -324,8 +345,9 @@ def generate_ubl_xml_sales(doc) -> str:
     invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
-    # 380 = Sales Invoice
-    inv_code = "380"
+    # نوع السداد: 011 نقدي / 021 آجل
+    is_cash = _is_cash_invoice(doc)
+    type_name = "011" if is_cash else "021"
 
     # استنتاج معدل الضريبة من Taxes أو 16%
     tax_rate = 0.0
@@ -389,7 +411,8 @@ def generate_ubl_xml_sales(doc) -> str:
         f'  <cbc:ID>{invoice_id}</cbc:ID>',
         f'  <cbc:UUID>{uuid}</cbc:UUID>',
         f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        f'  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
+        # الشكل المطلوب من JoFotara
+        f'  <cbc:InvoiceTypeCode name="{type_name}">388</cbc:InvoiceTypeCode>',
         f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
         "",
@@ -496,10 +519,15 @@ def on_submit_send(doc, method=None):
         url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
         headers = _build_headers(s)
 
+        # DEBUG: اطبع InvoiceTypeCode وأول 800 حرف
         if frappe.conf.get("developer_mode"):
             try:
-                frappe.log_error(message=f"Outgoing UBL (first 800 chars):\n{data['xml_min'][:800]}",
-                                 title="JoFotara DEBUG - Outgoing XML")
+                itc_match = re.search(r"<cbc:InvoiceTypeCode[^>]*>.*?</cbc:InvoiceTypeCode>", data["xml_min"])
+                itc_text = itc_match.group(0) if itc_match else "NOT FOUND"
+                frappe.log_error(
+                    message=f"InvoiceTypeCode: {itc_text}\nXML (first 800):\n{data['xml_min'][:800]}",
+                    title="JoFotara DEBUG - TypeCode"
+                )
             except Exception:
                 pass
 
