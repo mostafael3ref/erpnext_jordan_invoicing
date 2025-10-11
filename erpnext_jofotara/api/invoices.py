@@ -173,7 +173,7 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(line_blocks)
 
-    # رأس UBL: ID -> InvoiceTypeCode -> IssueDate -> DocumentCurrencyCode
+    # رأس UBL: ID -> IssueDate -> InvoiceTypeCode -> DocumentCurrencyCode
     parts: list[str] = []
     parts += [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -185,9 +185,8 @@ def generate_ubl_xml(doc) -> str:
         "  <cbc:ProfileID>reporting:1.0</cbc:ProfileID>",
         "  <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>",
         f"  <cbc:ID>{doc.name}</cbc:ID>",
-        # JoFawtra يتطلب InvoiceTypeCode قبل IssueDate
-        f'  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
         f"  <cbc:IssueDate>{issue_date}</cbc:IssueDate>",
+        f'  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
         f"  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>",
         "",
         "  <cac:AccountingSupplierParty>",
@@ -240,7 +239,6 @@ def generate_ubl_xml(doc) -> str:
         "</Invoice>",
     ]
     return "\n".join(parts)
-
 
 
 # =========================
