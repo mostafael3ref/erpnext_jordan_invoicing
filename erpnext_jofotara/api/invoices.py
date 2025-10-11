@@ -112,12 +112,12 @@ def _minify_xml(xml_str: str) -> str:
 # =========================
 
 def _seller_info(doc):
-    supplier_name = (frappe.db.get_value("Company", doc.company, "company_name") or doc.company or "").strip()
+    supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
 
     # خذ من الفاتورة -> من Company.tax_id -> من إعدادات JoFotara (seller_tax_number)
     s = _get_settings()
     supplier_tax_raw = (
-        (getattr(doc, "company_tax_id", None) or "")
+        (doc.company_tax_id or "")
         or (frappe.db.get_value("Company", doc.company, "tax_id") or "")
         or ((getattr(s, "seller_tax_number", None) or ""))
     ).strip()
@@ -129,15 +129,15 @@ def _seller_info(doc):
 
 
 def _buyer_info(doc):
-    customer_name = (getattr(doc, "customer_name", None) or getattr(doc, "customer", None) or "").strip()
+    customer_name = (doc.customer_name or doc.customer or "").strip()
     buyer_phone = (getattr(doc, "contact_phone", None) or getattr(doc, "contact_mobile", None) or "").strip()
     postal_code = ""
     try:
         if getattr(doc, "customer_address", None):
             postal_code = frappe.db.get_value("Address", doc.customer_address, "pincode") or ""
     except Exception:
-        postal_code = ""
-    buyer_id = (getattr(doc, "tax_id", None) or "").strip()
+        pass
+    buyer_id = (doc.tax_id or "").strip()
     buyer_scheme = "TN" if buyer_id else ""  # غيّرها لـ NIN/PN إذا لزم
     return customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme
 
@@ -166,17 +166,18 @@ def _uuid_icv(doc):
 def generate_ubl_xml_income(doc) -> str:
     s = _get_settings()
 
-    cur = ((doc.currency or "JOD") or "").upper()
-    issue_date = str(doc.posting_date or "")
+    cur = (doc.currency or "JOD").upper()
+    issue_date = str(doc.posting_date)
     note = (getattr(doc, "remarks", None) or getattr(doc, "po_no", None) or "").strip()
 
     invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
-    # 011 نقدي / 021 آجل — للمرجع فقط (لم نعد نضعها كـ name)
+    # 011 نقدي / 021 آجل
     is_cash = bool(getattr(doc, "is_pos", 0)) or (
         float(getattr(doc, "paid_amount", 0) or 0) >= float(getattr(doc, "grand_total", 0) or 0)
     )
+    type_name = "011" if is_cash else "021"
 
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
@@ -184,17 +185,26 @@ def generate_ubl_xml_income(doc) -> str:
     # احسب السطور والمجاميع
     total_item_discount = 0.0
     line_ext_total = 0.0
-    line_blocks = []
-    for idx, it in enumerate(getattr(doc, "items", []) or [], start=1):
-        qty = float(getattr(it, "qty", 0) or 1)
-        unit_price = float(getattr(it, "rate", 0) or 0)
+    for it in (doc.items or []):
+        qty = float(it.qty or 1)
+        unit_price = float(it.rate or 0)
         line_discount = float(getattr(it, "discount_amount", 0) or 0)
         net_line = (qty * unit_price) - line_discount
-        total_item_discount += max(line_discount, 0.0)
-        line_ext_total += max(net_line, 0.0)
+        total_item_discount += line_discount
+        line_ext_total += net_line
 
+    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
+    income_sequence = (getattr(s, "activity_number", None) or "").strip()
+
+    # سطور
+    line_blocks = []
+    for idx, it in enumerate(doc.items, start=1):
+        qty = float(it.qty or 1)
+        unit_price = float(it.rate or 0)
+        line_discount = float(getattr(it, "discount_amount", 0) or 0)
+        net_line = (qty * unit_price) - line_discount
         uom = _uom_code(getattr(it, "uom", None))
-        name = frappe.utils.escape_html(getattr(it, "item_name", None) or getattr(it, "item_code", None) or "Item")
+        name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
@@ -214,8 +224,10 @@ def generate_ubl_xml_income(doc) -> str:
             "  </cac:InvoiceLine>",
         ]))
     lines_xml = "\n".join(line_blocks)
-    allowance_total = max(total_item_discount, 0.0)
-    income_sequence = (getattr(s, "activity_number", None) or "").strip()
+
+    rounded_total = float(getattr(doc, "rounded_total", 0) or 0)
+    grand_total = float(getattr(doc, "grand_total", 0) or 0)
+    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or 0)
 
     parts = []
     parts += [
@@ -227,8 +239,7 @@ def generate_ubl_xml_income(doc) -> str:
         f'  <cbc:ID>{invoice_id}</cbc:ID>',
         f'  <cbc:UUID>{uuid}</cbc:UUID>',
         f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        # موحد: صيغة UN/CEFACT – القيمة 388 لـ Income
-        '  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">388</cbc:InvoiceTypeCode>',
+        f'  <cbc:InvoiceTypeCode name="{type_name}">388</cbc:InvoiceTypeCode>',
         f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
         f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
@@ -301,9 +312,11 @@ def generate_ubl_xml_income(doc) -> str:
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total or line_ext_total, 3)}</cbc:TaxInclusiveAmount>',
         f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:PayableAmount>',
+        # PayableRoundingAmount + PayableAmount = rounded_total
+        f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt((rounded_total or grand_total or line_ext_total), 3)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
@@ -317,8 +330,8 @@ def generate_ubl_xml_income(doc) -> str:
 # =========================
 
 def generate_ubl_xml_sales(doc) -> str:
-    cur = ((doc.currency or "JOD") or "").upper()
-    issue_date = str(doc.posting_date or "")
+    cur = (doc.currency or "JOD").upper()
+    issue_date = str(doc.posting_date)
     note = (getattr(doc, "remarks", None) or "").strip()
 
     invoice_id = doc.name
@@ -341,22 +354,19 @@ def generate_ubl_xml_sales(doc) -> str:
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
     # السطور والمجاميع
-    net_total = 0.0
-    tax_total = 0.0
-    grand_total = 0.0
+    total_item_discount = 0.0
+    net_total_calc = 0.0
     line_blocks = []
-    for idx, it in enumerate(getattr(doc, "items", []) or [], start=1):
-        qty = float(getattr(it, "qty", 0) or 1)
-        rate = float(getattr(it, "rate", 0) or 0)
+    for idx, it in enumerate(doc.items, start=1):
+        qty = float(it.qty or 1)
+        rate = float(it.rate or 0)
         discount = float(getattr(it, "discount_amount", 0) or 0)
         base = (qty * rate) - discount
-        tax_amt = base * (tax_rate / 100.0)
-        net_total += max(base, 0.0)
-        tax_total += max(tax_amt, 0.0)
-        grand_total += max(base + tax_amt, 0.0)
+        total_item_discount += discount
+        net_total_calc += base
 
         uom = _uom_code(getattr(it, "uom", None))
-        name = frappe.utils.escape_html(getattr(it, "item_name", None) or getattr(it, "item_code", None) or "Item")
+        name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
 
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
@@ -378,6 +388,14 @@ def generate_ubl_xml_sales(doc) -> str:
             "  </cac:InvoiceLine>",
         ]))
     lines_xml = "\n".join(line_blocks)
+
+    # استخدم أرقام ERP الفعلية عند توفرها
+    net_total = float(getattr(doc, "net_total", 0) or net_total_calc)
+    tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (net_total * tax_rate/100.0))
+    grand_total = float(getattr(doc, "grand_total", 0) or (net_total + tax_total))
+    rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
+    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
+    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
 
     parts = []
     parts += [
@@ -430,7 +448,7 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:Party>",
         "  </cac:AccountingCustomerParty>",
         "",
-        # ضريبة
+        # إجمالي الضريبة
         "  <cac:TaxTotal>",
         f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
         "    <cac:TaxSubtotal>",
@@ -442,11 +460,19 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:TaxSubtotal>",
         "  </cac:TaxTotal>",
         "",
+        # الخصومات + الإجماليات (مع التقريب)
+        "  <cac:AllowanceCharge>",
+        "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+        "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
+        f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
+        "  </cac:AllowanceCharge>",
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
         f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:PayableAmount>',
+        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
+        f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(rounded_total, 3)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
@@ -460,24 +486,10 @@ def generate_ubl_xml_sales(doc) -> str:
 # =========================
 
 def generate_ubl_xml(doc) -> str:
-    """
-    يختار Income أو Sales حسب الإعداد،
-    لكن لو فيه ضرائب موجبة على الفاتورة هنستخدم Sales تلقائيًا.
-    """
+    """يختار Income أو Sales حسب الإعداد أو يحاول Income أولاً."""
     s = _get_settings()
-
-    has_positive_tax = False
-    try:
-        if getattr(doc, "taxes", None):
-            for tx in doc.taxes:
-                if (tx.rate or 0) > 0:
-                    has_positive_tax = True
-                    break
-    except Exception:
-        has_positive_tax = False
-
     template = (getattr(s, "invoice_template", None) or "").strip().lower()
-    if has_positive_tax or template == "sales":
+    if template == "sales":
         return generate_ubl_xml_sales(doc)
     # default: income
     return generate_ubl_xml_income(doc)
@@ -517,10 +529,9 @@ def on_submit_send(doc, method=None):
             except Exception:
                 pass
 
-        # الإرسال الأول
         r = requests.post(url, json=data["payload"], headers=headers, timeout=90)
 
-        # لو غير مصرّح لنوع الفاتورة، جرّب Sales مرة واحدة
+        # جرّب Sales تلقائياً لو رسالة عدم السماح بنوع الفاتورة
         need_retry_as_sales = False
         if r.status_code >= 400:
             try:
