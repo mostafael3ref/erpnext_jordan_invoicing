@@ -69,7 +69,6 @@ def _build_headers(s):
     return headers
 
 
-# تنسيق للعرض فقط
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
         return f"{float(n):.{places}f}"
@@ -77,7 +76,6 @@ def _fmt(n: float | Decimal, places: int = 3) -> str:
         return f"{0:.{places}f}"
 
 
-# تقفية/تجميع بالأرقام العشرية
 _Q = Decimal("0.001")
 def _q(x) -> Decimal:
     try:
@@ -87,7 +85,6 @@ def _q(x) -> Decimal:
 
 
 def _uom_code(uom: str | None) -> str:
-    """UOM mapping. الافتراضي PCE (قطعة)."""
     if not uom:
         return "PCE"
     key = (uom or "").strip().lower()
@@ -122,7 +119,6 @@ def _minify_xml(xml_str: str) -> str:
 # =========================
 
 def _is_cash_invoice(doc) -> bool:
-    """يحدد إن كانت الفاتورة نقدية 011 أو آجل 021."""
     try:
         paid = float(getattr(doc, "paid_amount", 0) or 0)
         gt = float(getattr(doc, "grand_total", 0) or 0)
@@ -147,7 +143,6 @@ def _is_cash_invoice(doc) -> bool:
 def _seller_info(doc):
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
 
-    # خذ من الفاتورة -> من Company.tax_id -> من إعدادات JoFotara (seller_tax_number)
     s = _get_settings()
     supplier_tax_raw = (
         (doc.company_tax_id or "")
@@ -155,7 +150,7 @@ def _seller_info(doc):
         or ((getattr(s, "seller_tax_number", None) or ""))
     ).strip()
 
-    supplier_tax = re.sub(r"\D", "", supplier_tax_raw)  # أرقام فقط
+    supplier_tax = re.sub(r"\D", "", supplier_tax_raw)
     if not (1 <= len(supplier_tax) <= 15):
         frappe.throw(_("Seller Tax Number is required (1-15 digits). Current: '{0}'").format(supplier_tax_raw))
     return supplier_name, supplier_tax
@@ -171,7 +166,7 @@ def _buyer_info(doc):
     except Exception:
         pass
     buyer_id = (doc.tax_id or "").strip()
-    buyer_scheme = "TN" if buyer_id else ""  # غيّرها لـ NIN/PN إذا لزم
+    buyer_scheme = "TN" if buyer_id else ""
     return customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme
 
 
@@ -206,13 +201,11 @@ def generate_ubl_xml_income(doc) -> str:
     invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
-    # 011 نقدي / 021 آجل
     type_name = "011" if _is_cash_invoice(doc) else "021"
 
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
-    # السطور والمجاميع (Discount على مستوى السطر فقط)
     line_blocks = []
     line_ext_total = Decimal("0.000")
     for idx, it in enumerate(doc.items, start=1):
@@ -264,7 +257,6 @@ def generate_ubl_xml_income(doc) -> str:
         f"    <cbc:UUID>{icv}</cbc:UUID>",
         "  </cac:AdditionalDocumentReference>",
         "",
-        # Seller
         "  <cac:AccountingSupplierParty>",
         "    <cac:Party>",
         "      <cac:PostalAddress>",
@@ -280,7 +272,6 @@ def generate_ubl_xml_income(doc) -> str:
         "    </cac:Party>",
         "  </cac:AccountingSupplierParty>",
         "",
-        # Buyer
         "  <cac:AccountingCustomerParty>",
         "    <cac:Party>",
     ]
@@ -321,8 +312,6 @@ def generate_ubl_xml_income(doc) -> str:
             "",
         ]
 
-    # لا AllowanceCharge على مستوى الهيدر
-
     parts += [
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total)}</cbc:LineExtensionAmount>',
@@ -338,7 +327,7 @@ def generate_ubl_xml_income(doc) -> str:
 
 
 # =========================
-# UBL 2.1 - Sales Invoice (مسجّل ضريبة)
+# UBL 2.1 - Sales Invoice
 # =========================
 
 def generate_ubl_xml_sales(doc) -> str:
@@ -349,10 +338,8 @@ def generate_ubl_xml_sales(doc) -> str:
     invoice_id = doc.name
     uuid, icv = _uuid_icv(doc)
 
-    # نوع السداد: 011 نقدي / 021 آجل
     type_name = "011" if _is_cash_invoice(doc) else "021"
 
-    # استنتاج معدل الضريبة من Taxes أو 16%
     tax_rate = Decimal("0.000")
     if getattr(doc, "taxes", None):
         for tx in doc.taxes:
@@ -365,7 +352,6 @@ def generate_ubl_xml_sales(doc) -> str:
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
-    # السطور والمجاميع (Discount على مستوى السطر فقط)
     line_blocks = []
     net_total = Decimal("0.000")
     tax_total = Decimal("0.000")
@@ -376,7 +362,7 @@ def generate_ubl_xml_sales(doc) -> str:
         rate = _q(it.rate or 0)
         line_disc = _q(getattr(it, "discount_amount", 0) or 0)
 
-        base = _q(qty * rate - line_disc)      # صافي الأساس بعد خصم السطر
+        base = _q(qty * rate - line_disc)
         tax_amt = _q(base * (tax_rate / Decimal("100")))
 
         net_total += base
@@ -435,7 +421,6 @@ def generate_ubl_xml_sales(doc) -> str:
         f"    <cbc:UUID>{icv}</cbc:UUID>",
         "  </cac:AdditionalDocumentReference>",
         "",
-        # Seller
         "  <cac:AccountingSupplierParty>",
         "    <cac:Party>",
         "      <cac:PartyTaxScheme>",
@@ -448,7 +433,6 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:Party>",
         "  </cac:AccountingSupplierParty>",
         "",
-        # Buyer
         "  <cac:AccountingCustomerParty>",
         "    <cac:Party>",
     ]
@@ -485,7 +469,6 @@ def generate_ubl_xml_sales(doc) -> str:
             "",
         ]
 
-    # الضريبة الإجمالية
     parts += [
         "  <cac:TaxTotal>",
         f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total)}</cbc:TaxAmount>',
@@ -498,12 +481,6 @@ def generate_ubl_xml_sales(doc) -> str:
         "    </cac:TaxSubtotal>",
         "  </cac:TaxTotal>",
         "",
-    ]
-
-    # لا AllowanceCharge على مستوى الهيدر
-    # لا ترسل AllowanceTotalAmount لأن الخصم طبقناه بالفعل على مستوى السطور
-
-    parts += [
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total)}</cbc:TaxExclusiveAmount>',
@@ -518,16 +495,52 @@ def generate_ubl_xml_sales(doc) -> str:
 
 
 # =========================
-# واجهة موحّدة لاختيار النوع
+# اختيار النوع (AUTO)
 # =========================
 
+def _has_vat(doc) -> bool:
+    try:
+        for tx in (getattr(doc, "taxes", None) or []):
+            if float(tx.rate or 0) > 0 or float(tx.tax_amount or 0) > 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def generate_ubl_xml(doc) -> str:
-    """يختار Income أو Sales حسب الإعداد أو يحاول Income أولاً."""
+    """
+    يختار Income أو Sales تلقائيًا:
+      - لو في ضريبة > 0 => Sales
+      - غير كده => Income
+    ولو الإعدادات حددت نوع، بنحترمه، لكن لو اختير income وفي ضريبة، نجبر Sales لتفادي الرفض.
+    """
     s = _get_settings()
-    template = (getattr(s, "invoice_template", None) or "").strip().lower()
-    if template == "sales":
-        return generate_ubl_xml_sales(doc)
-    # default: income
+    setting = (getattr(s, "invoice_template", None) or "").strip().lower()
+    has_vat = _has_vat(doc)
+
+    chosen = setting or "auto"
+    if chosen == "sales" or (chosen != "income" and has_vat):
+        xml = generate_ubl_xml_sales(doc)
+        try:
+            frappe.log_error("JoFotara XML built as SALES", "JoFotara DEBUG")
+        except Exception:
+            pass
+        return xml
+
+    if chosen == "income" and has_vat:
+        # إجبار Sales لو فيه ضريبة رغم اختيار income
+        xml = generate_ubl_xml_sales(doc)
+        try:
+            frappe.log_error("Forcing SALES because invoice has VAT", "JoFotara DEBUG")
+        except Exception:
+            pass
+        return xml
+
+    try:
+        frappe.log_error("JoFotara XML built as INCOME", "JoFotara DEBUG")
+    except Exception:
+        pass
     return generate_ubl_xml_income(doc)
 
 
@@ -558,7 +571,6 @@ def on_submit_send(doc, method=None):
         url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
         headers = _build_headers(s)
 
-        # DEBUG: اطبع InvoiceTypeCode وأول 800 حرف
         if frappe.conf.get("developer_mode"):
             try:
                 itc_match = re.search(r"<cbc:InvoiceTypeCode[^>]*>.*?</cbc:InvoiceTypeCode>", data["xml_min"])
@@ -570,10 +582,8 @@ def on_submit_send(doc, method=None):
             except Exception:
                 pass
 
-        # الإرسال الأول
         r = requests.post(url, json=data["payload"], headers=headers, timeout=90)
 
-        # لو غير مصرّح لنوع الفاتورة، جرّب Sales مرة واحدة
         need_retry_as_sales = False
         if r.status_code >= 400:
             try:
