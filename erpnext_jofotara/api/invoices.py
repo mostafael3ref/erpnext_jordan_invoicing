@@ -185,6 +185,8 @@ def generate_ubl_xml(doc) -> str:
         "  <cbc:ProfileID>reporting:1.0</cbc:ProfileID>",
         "  <cbc:ProfileExecutionID>ISTD-1.0</cbc:ProfileExecutionID>",
         f"  <cbc:ID>{doc.name}</cbc:ID>",
+        # (اختياري لكنه متوافق مع الـ XSD)
+        "  <cbc:CopyIndicator>false</cbc:CopyIndicator>",
         f"  <cbc:IssueDate>{issue_date}</cbc:IssueDate>",
         f'  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
         f"  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>",
