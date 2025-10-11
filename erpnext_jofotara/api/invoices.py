@@ -158,9 +158,12 @@ def generate_ubl_xml(doc) -> str:
     )
     type_name = "011" if is_cash else "021"  # Income فقط
 
-    # بيانات البائع (taxpayer)
+    # بيانات البائع (taxpayer) — الرقم الضريبي إلزامي وأرقام فقط 1..15
     supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
-    supplier_tax = (doc.company_tax_id or "").strip()
+    supplier_tax_raw = (doc.company_tax_id or "").strip()
+    supplier_tax = re.sub(r"\D", "", supplier_tax_raw)  # أرقام فقط
+    if not (1 <= len(supplier_tax) <= 15):
+        frappe.throw(_("Seller Tax Number is required (1-15 digits). Current: '{0}'").format(supplier_tax_raw))
 
     # بيانات المشتري (مختصرة لـ Income)
     customer_name = (doc.customer_name or doc.customer or "").strip()
@@ -176,21 +179,23 @@ def generate_ubl_xml(doc) -> str:
     buyer_id = (doc.tax_id or "").strip()
     buyer_scheme = "TN" if buyer_id else ""  # غيّرها لـ NIN/PN لو عندك حقل مخصص
 
-    # المجاميع
-    net_total = float(doc.net_total or doc.total or 0)         # قبل الخصومات العامة
-    grand_total = float(doc.grand_total or net_total)
-    total_item_discount = 0.0
+    # ===== احسب المجاميع من السطور التي سنرسلها =====
+    gross_lines = 0.0          # مجموع (qty * rate) قبل الخصم
+    total_item_discount = 0.0  # مجموع خصومات السطور
+    line_ext_total = 0.0       # مجموع صافي السطور بعد خصم السطور
 
-    # أسطر الفاتورة
     line_blocks: list[str] = []
     for idx, it in enumerate(doc.items, start=1):
         qty = float(it.qty or 1)
         unit_price = float(it.rate or 0)  # Income بدون VAT
         line_discount = float(getattr(it, "discount_amount", 0) or 0)
-        total_item_discount += line_discount
+        gross = qty * unit_price
+        net_line = gross - line_discount
 
-        # قيمة السطر = (السعر * الكمية) - خصم السطر
-        line_total = (qty * unit_price) - line_discount
+        gross_lines += gross
+        total_item_discount += line_discount
+        line_ext_total += net_line
+
         uom = _uom_code(getattr(it, "uom", None))
         name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
 
@@ -199,7 +204,7 @@ def generate_ubl_xml(doc) -> str:
                 "  <cac:InvoiceLine>",
                 f"    <cbc:ID>{idx}</cbc:ID>",
                 f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty, 2)}</cbc:InvoicedQuantity>',
-                f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_total, 3)}</cbc:LineExtensionAmount>',
+                f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_line, 3)}</cbc:LineExtensionAmount>',
                 "    <cac:Item>",
                 f"      <cbc:Name>{name}</cbc:Name>",
                 "    </cac:Item>",
@@ -217,7 +222,10 @@ def generate_ubl_xml(doc) -> str:
 
     lines_xml = "\n".join(line_blocks)
 
-    # Allowance الإجمالي من خصومات البنود (لا نستخدم خصم على مستوى الفاتورة)
+    # في Income لا يوجد VAT: إذن الشامل = الصافي = المستحق
+    tax_exclusive_total = line_ext_total
+    tax_inclusive_total = line_ext_total
+    payable_total = line_ext_total
     allowance_total = max(total_item_discount, 0.0)
 
     # sequence of income source من الإعدادات (Activity Number)
@@ -311,10 +319,11 @@ def generate_ubl_xml(doc) -> str:
         f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
         "  </cac:AllowanceCharge>",
         "  <cac:LegalMonetaryTotal>",
-        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:LineExtensionAmount>',
+        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(tax_exclusive_total, 3)}</cbc:TaxExclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(tax_inclusive_total, 3)}</cbc:TaxInclusiveAmount>',
         f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:PayableAmount>',
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(payable_total, 3)}</cbc:PayableAmount>',
         "  </cac:LegalMonetaryTotal>",
         "",
         lines_xml,
