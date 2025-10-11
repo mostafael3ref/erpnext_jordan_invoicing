@@ -30,7 +30,7 @@
 
     {"label": "Payload Format", "fieldname": "payload_format", "fieldtype": "Select", "options": "XML_UPL_2_1\nJSON", "default": "XML_UPL_2_1"},
 
-    /* === الحقول الجديدة === */
+    
     {
       "label": "Invoice Template",
       "fieldname": "invoice_template",
