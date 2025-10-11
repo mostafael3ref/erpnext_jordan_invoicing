@@ -261,7 +261,7 @@ def generate_ubl_xml_income(doc) -> str:
         f'  <cbc:ID>{invoice_id}</cbc:ID>',
         f'  <cbc:UUID>{uuid}</cbc:UUID>',
         f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        f'  <cbc:InvoiceTypeCode name="{type_name}">388</cbc:InvoiceTypeCode>',
+        f'  <cbc:InvoiceTypeCode name="011">388</cbc:InvoiceTypeCode>',
         f'  <cbc:Note>{note}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
         f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
