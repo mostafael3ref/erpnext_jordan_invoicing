@@ -143,13 +143,25 @@ def build_invoice_xml(si_name: str) -> str:
         ]))
 
     # أرقام ERP الحقيقية إن وُجدت
+    # أرقام ERP الحقيقية إن وُجدت
     net_total = float(getattr(doc, "net_total", 0) or line_ext_total)
+
+    # ✅ خصم المستند فقط (document-level) — لا تجمع خصومات السطور مرة أخرى
+    document_discount = float(getattr(doc, "discount_amount", 0) or 0.0)
+    allowance_total = max(document_discount, 0.0)
+
+    # القاعدة الخاضعة للضريبة = صافي السطور - خصم المستند
+    taxable_base = max(net_total - allowance_total, 0.0)
+
+    # الضريبة: استخدم ERP إن وُجدت، وإلا احسب على القاعدة بعد الخصم
     tax_rate = _tax_rate_from_doc(doc)
-    tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (net_total * tax_rate / 100.0))
-    grand_total = float(getattr(doc, "grand_total", 0) or (net_total + tax_total))
+    tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (taxable_base * tax_rate / 100.0))
+
+    # الإجماليات
+    grand_total = float(getattr(doc, "grand_total", 0) or (taxable_base + tax_total))
     rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
     rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
-    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
+
 
     lines_xml = "\n".join(line_blocks)
 
@@ -217,7 +229,7 @@ def build_invoice_xml(si_name: str) -> str:
         ""
     ]
 
-    # ✅ UBL sequence fix: ضع AllowanceCharge قبل TaxTotal/LegalMonetaryTotal
+    # ✅ AllowanceCharge على مستوى المستند (إن وُجد خصم مستندي)
     if allowance_total and allowance_total != 0:
         parts += [
             "  <cac:AllowanceCharge>",
@@ -228,13 +240,13 @@ def build_invoice_xml(si_name: str) -> str:
             ""
         ]
 
-    # TaxTotal (إن وُجدت ضريبة)
+    # ✅ TaxTotal: احرص إن TaxableAmount = taxable_base (بعد خصم المستند)
     if tax_total and tax_total != 0:
         parts += [
             "  <cac:TaxTotal>",
             f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
             "    <cac:TaxSubtotal>",
-            f'      <cbc:TaxableAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxableAmount>',
+            f'      <cbc:TaxableAmount currencyID="{cur}">{_fmt(taxable_base, 3)}</cbc:TaxableAmount>',
             f'      <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
             "      <cac:TaxCategory>",
             "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
@@ -244,12 +256,12 @@ def build_invoice_xml(si_name: str) -> str:
             ""
         ]
 
-    # LegalMonetaryTotal
+    # ✅ LegalMonetaryTotal: TaxExclusive = taxable_base و TaxInclusive = taxable_base + tax_total
     parts += [
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
-        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(taxable_base, 3)}</cbc:TaxExclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(taxable_base + tax_total, 3)}</cbc:TaxInclusiveAmount>',
         f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
         f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
         f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(rounded_total, 3)}</cbc:PayableAmount>',
@@ -258,5 +270,6 @@ def build_invoice_xml(si_name: str) -> str:
         lines_xml,
         "</Invoice>",
     ]
+
     return "\n".join(parts)
 
