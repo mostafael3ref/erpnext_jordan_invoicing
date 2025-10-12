@@ -19,7 +19,7 @@ doctype_js = {}
 # إرسال تلقائي عند اعتماد الفاتورة (لو مفعّل في الإعدادات داخل الدالة)
 doc_events = {
     "Sales Invoice": {
-        "on_submit": "erpnext_jofotara.api.invoices.on_submit_send"
+        "on_submit": "erpnext_jofotara.api.invoices.on_submit_sales_invoice"
     }
 }
 
