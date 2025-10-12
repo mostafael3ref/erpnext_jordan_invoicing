@@ -91,7 +91,6 @@ def _tax_rate_from_doc(doc) -> float:
             rate = float(tx.rate or 0)
             break
     return rate
-
 def build_invoice_xml(si_name: str) -> str:
     """يبني XML بصيغة UBL 2.1 لواجهة JoFotara. يدعم 388 و 381 تلقائيًا."""
     doc = frappe.get_doc("Sales Invoice", si_name)
@@ -215,10 +214,21 @@ def build_invoice_xml(si_name: str) -> str:
         f"      <cbc:Telephone>{frappe.utils.escape_html(buyer_phone)}</cbc:Telephone>",
         "    </cac:AccountingContact>",
         "  </cac:AccountingCustomerParty>",
-        "",
+        ""
     ]
 
-    # إجمالي الضريبة (لو في ضريبة)
+    # ✅ UBL sequence fix: ضع AllowanceCharge قبل TaxTotal/LegalMonetaryTotal
+    if allowance_total and allowance_total != 0:
+        parts += [
+            "  <cac:AllowanceCharge>",
+            "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+            "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
+            f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
+            "  </cac:AllowanceCharge>",
+            ""
+        ]
+
+    # TaxTotal (إن وُجدت ضريبة)
     if tax_total and tax_total != 0:
         parts += [
             "  <cac:TaxTotal>",
@@ -231,16 +241,11 @@ def build_invoice_xml(si_name: str) -> str:
             "      </cac:TaxCategory>",
             "    </cac:TaxSubtotal>",
             "  </cac:TaxTotal>",
-            "",
+            ""
         ]
 
-    # الخصومات + الإجماليات
+    # LegalMonetaryTotal
     parts += [
-        "  <cac:AllowanceCharge>",
-        "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
-        "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
-        f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
-        "  </cac:AllowanceCharge>",
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
         f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
@@ -254,3 +259,4 @@ def build_invoice_xml(si_name: str) -> str:
         "</Invoice>",
     ]
     return "\n".join(parts)
+
