@@ -32,11 +32,35 @@ def _mask_headers(h: dict) -> dict:
 
 
 def _build_headers(s) -> dict:
-    client_id = (s.client_id or "").strip()
+    """
+    يبني رؤوس JoFotara:
+      - Client-Id / Secret-Key
+      - Accept / Content-Type JSON
+    ويدعم طريقتين:
+      1) OAuth2 مفعّل -> يستخدم client_id/secret_key
+      2) OAuth2 غير مفعّل -> يستخدم device_user/device_secret كبديل
+    """
+    use_oauth2 = int(getattr(s, "use_oauth2", 0) or 0)
+
+    client_id = (getattr(s, "client_id", None) or "").strip()
     client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
 
+    device_user = (getattr(s, "device_user", None) or "").strip()
+    device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
+
+    if use_oauth2:
+        # لازم Client ID/Secret
+        if not client_id or not client_secret:
+            frappe.throw("JoFotara Settings: الرجاء تعبئة Client ID و Secret Key (Enable OAuth2 مفعّل).")
+    else:
+        # Alt Auth (Device) بديل لو Client ID/Secret ناقصين
+        if not client_id and device_user:
+            client_id = device_user
+        if not client_secret and device_secret:
+            client_secret = device_secret
+
     if not client_id or not client_secret:
-        frappe.throw("JoFotara Settings: Client-Id/Secret-Key are required.")
+        frappe.throw("JoFotara Settings: وفّر Client ID/Secret أو Device User/Secret.")
 
     headers = {
         "Accept": "application/json",
@@ -46,11 +70,11 @@ def _build_headers(s) -> dict:
         "Secret-Key": client_secret,
     }
 
-    # رؤوس اختيارية لو موجودة بالإعدادات
+    # رؤوس اختيارية
     activity = (getattr(s, "activity_number", None) or "").strip()
     if activity:
         headers["Activity-Number"] = activity
-        headers["Key"] = activity  # بعض البيئات تطلبه
+        headers["Key"] = activity  # بعض البيئات تتوقعه
 
     return headers
 
@@ -66,20 +90,21 @@ def to_b64(xml_str: str) -> str:
 
 def post_invoice(b64xml: str) -> dict:
     """
-    يرسل الفاتورة إلى JoFotara حسب الدليل 1.4:
-      - POST { "invoice": "<Base64(XML)>" }
-      - رؤوس: Client-Id, Secret-Key, Content-Type: application/json
-      - المسار الافتراضي: https://backend.jofotara.gov.jo/core/invoices/
+    إرسال الفاتورة حسب الدليل 1.4:
+      POST { "invoice": "<Base64(XML)>" }
+      إلى: base_url + submit_url
+      مع رؤوس Client-Id/Secret-Key
     """
     s = _get_settings()
-    base = (getattr(s, "endpoint_base", None) or "https://backend.jofotara.gov.jo").strip()
-    path = (getattr(s, "invoices_path", None) or "/core/invoices/").strip()
+
+    # استخدم الحقول الموجودة في DocType (مش endpoint_base/invoices_path)
+    base = (getattr(s, "base_url", None) or "https://backend.jofotara.gov.jo").strip()
+    path = (getattr(s, "submit_url", None) or "/core/invoices/").strip()
     url = _full_url(base, path)
 
     payload = {"invoice": b64xml}
     headers = _build_headers(s)
 
-    # لوج نظيف لا يظهر الأسرار
     frappe.logger().info({
         "jofotara_url": url,
         "headers": _mask_headers(headers),
@@ -87,24 +112,24 @@ def post_invoice(b64xml: str) -> dict:
     })
 
     try:
-        resp = requests.post(url, data=json.dumps(payload), headers=headers, timeout=30)
+        # استخدم json=payload عشان يحدد Content-Length و JSON تلقائيًا
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
     except Exception as e:
         frappe.throw(f"JoFotara network error: {e}")
 
-    # حاول JSON وإلا خذ النص الخام
+    # حاول تقرأ JSON وإلا رجّع النص
     try:
         data = resp.json()
     except Exception:
-        data = {"text": resp.text}
+        data = {"text": resp.text or ""}
 
-    # خزّن معاينة الرد في الإعدادات للمراجعة
+    # خزّن آخر رد للمراجعة السريعة في Settings
     try:
         s.db_set("last_response", json.dumps(data, ensure_ascii=False)[:1400])
     except Exception:
         pass
 
     if resp.status_code >= 400:
-        # سجل التفاصيل لمساعدتك في التصحيح
         frappe.log_error(
             title="JoFotara API Error",
             message=(
