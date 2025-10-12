@@ -1,613 +1,159 @@
 # erpnext_jofotara/api/invoices.py
 from __future__ import annotations
 
-import base64
-import re
-from decimal import Decimal
-from urllib.parse import urljoin
+import json
+from typing import Any, Dict
 
-import requests
 import frappe
 from frappe import _
-from erpnext_jofotara.install import ensure_custom_fields
+from frappe.utils import now
+
+# نعتمد على client.py و transform.py داخل نفس الباكدج
+from .client import post_invoice, to_b64  # post_invoice(b64xml) -> dict
+from .transform import build_invoice_xml   # build_invoice_xml(sales_invoice_name) -> xml string
 
 
 # =========================
-# Helpers
+# Utilities
 # =========================
-
-def _full_url(base: str, path: str) -> str:
-    if (path or "").startswith("http"):
-        return path
-    return urljoin((base or "").rstrip("/") + "/", (path or "").lstrip("/"))
-
 
 def _get_settings():
+    """Fetch JoFotara Settings single doctype."""
     return frappe.get_single("JoFotara Settings")
 
 
-def _mask_headers(h: dict) -> dict:
-    masked = dict(h or {})
-    for k in ("Secret-Key", "Authorization"):
-        if k in masked and masked[k]:
-            masked[k] = "********"
-    return masked
-
-
-def _build_headers(s):
-    client_id = (s.client_id or "").strip()
-    client_secret = (s.get_password("secret_key", raise_exception=False) or "").strip()
-
-    device_user = (s.device_user or "").strip()
-    device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
-
-    # fallback من Device لو Client فاضي
-    if not client_id and device_user:
-        client_id = device_user
-    if not client_secret and device_secret:
-        client_secret = device_secret
-
-    if not client_id or not client_secret:
-        frappe.throw(
-            _("JoFotara Settings is missing credentials. Fill either Client ID/Secret or Device User/Secret.")
-        )
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Client-Id": client_id,
-        "Secret-Key": client_secret,
-        "Accept-Language": "ar",
-    }
-
-    key = (s.activity_number or "").strip()
-    if key:
-        headers["Key"] = key
-        headers["Activity-Number"] = key
-        headers["ActivityNumber"] = key
-
-    return headers
-
-
-def _fmt(n: float | Decimal, places: int = 3) -> str:
-    try:
-        return f"{float(n):.{places}f}"
-    except Exception:
-        return f"{0:.{places}f}"
-
-
-def _uom_code(uom: str | None) -> str:
-    """UOM mapping. الافتراضي PCE (قطعة)."""
-    if not uom:
-        return "PCE"
-    key = (uom or "").strip().lower()
-    mapping = {
-        "unit": "PCE", "units": "PCE", "each": "PCE", "pcs": "PCE", "piece": "PCE", "nos": "PCE",
-        "وحدة": "PCE", "قطعة": "PCE",
-        "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
-        "g": "GRM", "gram": "GRM",
-        "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
-        "ml": "MLT",
-        "m": "MTR", "meter": "MTR", "متر": "MTR",
-        "cm": "CMT", "mm": "MMT",
-        "hour": "HUR", "hr": "HUR", "ساعة": "HUR",
-        "day": "DAY", "يوم": "DAY",
-        "month": "MON", "شهر": "MON",
-        "year": "ANN", "سنة": "ANN",
-    }
-    return mapping.get(key, "PCE")
-
-
 def _minify_xml(xml_str: str) -> str:
+    """إزالة المسافات والأسطر غير الضرورية (يحافظ على المحتوى)."""
     if not xml_str:
         return xml_str
     s = xml_str.replace("\r", "").replace("\n", "").replace("\t", "").strip()
-    s = re.sub(r">\s+<", "><", s)
-    s = s.replace("\ufeff", "")
+    # لا نستخدم regex ثقيل هنا لتفادي كسر وسوم ضمن نصوص، هذا كافي للـ UBL المبني تلقائياً
+    while "  " in s:
+        s = s.replace("  ", " ")
+    s = s.replace("> <", "><")
     return s
 
 
-# =========================
-# مشتركات
-# =========================
-
-def _seller_info(doc):
-    supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
-
-    # خذ من الفاتورة -> من Company.tax_id -> من إعدادات JoFotara (seller_tax_number)
-    s = _get_settings()
-    supplier_tax_raw = (
-        (doc.company_tax_id or "")
-        or (frappe.db.get_value("Company", doc.company, "tax_id") or "")
-        or ((getattr(s, "seller_tax_number", None) or ""))
-    ).strip()
-
-    supplier_tax = re.sub(r"\D", "", supplier_tax_raw)  # أرقام فقط
-    if not (1 <= len(supplier_tax) <= 15):
-        frappe.throw(_("Seller Tax Number is required (1-15 digits). Current: '{0}'").format(supplier_tax_raw))
-    return supplier_name, supplier_tax
-
-
-def _buyer_info(doc):
-    customer_name = (doc.customer_name or doc.customer or "").strip()
-    buyer_phone = (getattr(doc, "contact_phone", None) or getattr(doc, "contact_mobile", None) or "").strip()
-    postal_code = ""
+def _store_response_preview_in_settings(resp: Dict[str, Any]) -> None:
+    """خزن آخر رد (مختصر) في JoFotara Settings ليسهل الديبغ من الديسكتوب."""
     try:
-        if getattr(doc, "customer_address", None):
-            postal_code = frappe.db.get_value("Address", doc.customer_address, "pincode") or ""
-    except Exception:
-        pass
-    buyer_id = (doc.tax_id or "").strip()
-    buyer_scheme = "TN" if buyer_id else ""  # غيّرها لـ NIN/PN إذا لزم
-    return customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme
-
-
-def _uuid_icv(doc):
-    uuid = (getattr(doc, "jofotara_uuid", None) or frappe.generate_hash(length=36))
-    try:
-        if not getattr(doc, "jofotara_uuid", None) and doc.meta.has_field("jofotara_uuid"):
-            doc.db_set("jofotara_uuid", uuid)
+        s = _get_settings()
+        s.db_set("last_response", json.dumps(resp, ensure_ascii=False)[:1400])
     except Exception:
         pass
 
-    icv = int(getattr(doc, "jofotara_icv", 0) or 1)
+
+def _set_status(doc, status: str, err: str | None = None) -> None:
+    """تحديث حالة التكامل على الفاتورة (آمن حتى لو الحقول غير موجودة)."""
     try:
-        if doc.meta.has_field("jofotara_icv") and not getattr(doc, "jofotara_icv", None):
-            doc.db_set("jofotara_icv", icv)
-    except Exception:
-        pass
-    return uuid, icv
-
-
-# =========================
-# UBL 2.1 - Income Invoice
-# =========================
-
-def generate_ubl_xml_income(doc) -> str:
-    s = _get_settings()
-
-    cur = (doc.currency or "JOD").upper()
-    issue_date = str(doc.posting_date)
-    note = (getattr(doc, "remarks", None) or getattr(doc, "po_no", None) or "").strip()
-
-    invoice_id = doc.name
-    uuid, icv = _uuid_icv(doc)
-
-    # 011 نقدي / 021 آجل
-    is_cash = bool(getattr(doc, "is_pos", 0)) or (
-        float(getattr(doc, "paid_amount", 0) or 0) >= float(getattr(doc, "grand_total", 0) or 0)
-    )
-    type_name = "011" if is_cash else "021"
-
-    supplier_name, supplier_tax = _seller_info(doc)
-    customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
-
-    # احسب السطور والمجاميع
-    total_item_discount = 0.0
-    line_ext_total = 0.0
-    for it in (doc.items or []):
-        qty = float(it.qty or 1)
-        unit_price = float(it.rate or 0)
-        line_discount = float(getattr(it, "discount_amount", 0) or 0)
-        net_line = (qty * unit_price) - line_discount
-        total_item_discount += line_discount
-        line_ext_total += net_line
-
-    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
-    income_sequence = (getattr(s, "activity_number", None) or "").strip()
-
-    # سطور
-    line_blocks = []
-    for idx, it in enumerate(doc.items, start=1):
-        qty = float(it.qty or 1)
-        unit_price = float(it.rate or 0)
-        line_discount = float(getattr(it, "discount_amount", 0) or 0)
-        net_line = (qty * unit_price) - line_discount
-        uom = _uom_code(getattr(it, "uom", None))
-        name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
-        line_blocks.append("\n".join([
-            "  <cac:InvoiceLine>",
-            f"    <cbc:ID>{idx}</cbc:ID>",
-            f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty, 2)}</cbc:InvoicedQuantity>',
-            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_line, 3)}</cbc:LineExtensionAmount>',
-            "    <cac:Item>",
-            f"      <cbc:Name>{name}</cbc:Name>",
-            "    </cac:Item>",
-            "    <cac:Price>",
-            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(unit_price, 3)}</cbc:PriceAmount>',
-            "      <cac:AllowanceCharge>",
-            "        <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
-            "        <cbc:AllowanceChargeReason>DISCOUNT</cbc:AllowanceChargeReason>",
-            f'        <cbc:Amount currencyID="{cur}">{_fmt(line_discount, 3)}</cbc:Amount>',
-            "      </cac:AllowanceCharge>",
-            "    </cac:Price>",
-            "  </cac:InvoiceLine>",
-        ]))
-    lines_xml = "\n".join(line_blocks)
-
-    rounded_total = float(getattr(doc, "rounded_total", 0) or 0)
-    grand_total = float(getattr(doc, "grand_total", 0) or 0)
-    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or 0)
-
-    parts = []
-    parts += [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"',
-        '         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"',
-        '         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">',
-        '  <cbc:ProfileID>reporting:1.0</cbc:ProfileID>',
-        f'  <cbc:ID>{invoice_id}</cbc:ID>',
-        f'  <cbc:UUID>{uuid}</cbc:UUID>',
-        f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        f'  <cbc:InvoiceTypeCode name="{type_name}">388</cbc:InvoiceTypeCode>',
-        f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
-        f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
-        f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
-        "  <cac:AdditionalDocumentReference>",
-        "    <cbc:ID>ICV</cbc:ID>",
-        f"    <cbc:UUID>{icv}</cbc:UUID>",
-        "  </cac:AdditionalDocumentReference>",
-        "",
-        # Seller
-        "  <cac:AccountingSupplierParty>",
-        "    <cac:Party>",
-        "      <cac:PostalAddress>",
-        "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
-        "      </cac:PostalAddress>",
-        "      <cac:PartyTaxScheme>",
-        f"        <cbc:CompanyID>{frappe.utils.escape_html(supplier_tax)}</cbc:CompanyID>",
-        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-        "      </cac:PartyTaxScheme>",
-        "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{frappe.utils.escape_html(supplier_name)}</cbc:RegistrationName>",
-        "      </cac:PartyLegalEntity>",
-        "    </cac:Party>",
-        "  </cac:AccountingSupplierParty>",
-        "",
-        # Buyer
-        "  <cac:AccountingCustomerParty>",
-        "    <cac:Party>",
-    ]
-    if buyer_id:
-        parts += [
-            "      <cac:PartyIdentification>",
-            f'        <cbc:ID schemeID="{buyer_scheme}">{frappe.utils.escape_html(buyer_id)}</cbc:ID>',
-            "      </cac:PartyIdentification>",
-        ]
-    parts += [
-        "      <cac:PostalAddress>",
-        f"        <cbc:PostalZone>{frappe.utils.escape_html(postal_code)}</cbc:PostalZone>",
-        "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
-        "      </cac:PostalAddress>",
-        "      <cac:PartyTaxScheme>",
-        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-        "      </cac:PartyTaxScheme>",
-        "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{frappe.utils.escape_html(customer_name)}</cbc:RegistrationName>",
-        "      </cac:PartyLegalEntity>",
-        "    </cac:Party>",
-        "    <cac:AccountingContact>",
-        f"      <cbc:Telephone>{frappe.utils.escape_html(buyer_phone)}</cbc:Telephone>",
-        "    </cac:AccountingContact>",
-        "  </cac:AccountingCustomerParty>",
-        "",
-    ]
-    if income_sequence:
-        parts += [
-            "  <cac:SellerSupplierParty>",
-            "    <cac:Party>",
-            "      <cac:PartyIdentification>",
-            f"        <cbc:ID>{frappe.utils.escape_html(income_sequence)}</cbc:ID>",
-            "      </cac:PartyIdentification>",
-            "    </cac:Party>",
-            "  </cac:SellerSupplierParty>",
-            "",
-        ]
-    parts += [
-        "  <cac:AllowanceCharge>",
-        "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
-        "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
-        f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
-        "  </cac:AllowanceCharge>",
-        "  <cac:LegalMonetaryTotal>",
-        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:LineExtensionAmount>',
-        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(line_ext_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total or line_ext_total, 3)}</cbc:TaxInclusiveAmount>',
-        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        # PayableRoundingAmount + PayableAmount = rounded_total
-        f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt((rounded_total or grand_total or line_ext_total), 3)}</cbc:PayableAmount>',
-        "  </cac:LegalMonetaryTotal>",
-        "",
-        lines_xml,
-        "</Invoice>",
-    ]
-    return "\n".join(parts)
-
-
-# =========================
-# UBL 2.1 - Sales Invoice (مسجّل ضريبة)
-# =========================
-
-def generate_ubl_xml_sales(doc) -> str:
-    cur = (doc.currency or "JOD").upper()
-    issue_date = str(doc.posting_date)
-    note = (getattr(doc, "remarks", None) or "").strip()
-
-    invoice_id = doc.name
-    uuid, icv = _uuid_icv(doc)
-
-    # 380 = Sales Invoice
-    inv_code = "380"
-
-    # استنتاج معدل الضريبة من Taxes أو 16%
-    tax_rate = 0.0
-    if getattr(doc, "taxes", None):
-        for tx in doc.taxes:
-            if (tx.rate or 0) > 0:
-                tax_rate = float(tx.rate or 0)
-                break
-    if tax_rate <= 0:
-        tax_rate = 16.0
-
-    supplier_name, supplier_tax = _seller_info(doc)
-    customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
-
-    # السطور والمجاميع
-    total_item_discount = 0.0
-    net_total_calc = 0.0
-    line_blocks = []
-    for idx, it in enumerate(doc.items, start=1):
-        qty = float(it.qty or 1)
-        rate = float(it.rate or 0)
-        discount = float(getattr(it, "discount_amount", 0) or 0)
-        base = (qty * rate) - discount
-        total_item_discount += discount
-        net_total_calc += base
-
-        uom = _uom_code(getattr(it, "uom", None))
-        name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
-
-        line_blocks.append("\n".join([
-            "  <cac:InvoiceLine>",
-            f"    <cbc:ID>{idx}</cbc:ID>",
-            f'    <cbc:InvoicedQuantity unitCode="{uom}">{_fmt(qty, 2)}</cbc:InvoicedQuantity>',
-            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(base, 3)}</cbc:LineExtensionAmount>',
-            "    <cac:Item>",
-            f"      <cbc:Name>{name}</cbc:Name>",
-            "      <cac:ClassifiedTaxCategory>",
-            "        <cbc:ID>S</cbc:ID>",
-            f"        <cbc:Percent>{_fmt(tax_rate)}</cbc:Percent>",
-            "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-            "      </cac:ClassifiedTaxCategory>",
-            "    </cac:Item>",
-            "    <cac:Price>",
-            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(rate, 3)}</cbc:PriceAmount>',
-            f'      <cbc:BaseQuantity unitCode="{uom}">{_fmt(1)}</cbc:BaseQuantity>',
-            "    </cac:Price>",
-            "  </cac:InvoiceLine>",
-        ]))
-    lines_xml = "\n".join(line_blocks)
-
-    # استخدم أرقام ERP الفعلية عند توفرها
-    net_total = float(getattr(doc, "net_total", 0) or net_total_calc)
-    tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (net_total * tax_rate/100.0))
-    grand_total = float(getattr(doc, "grand_total", 0) or (net_total + tax_total))
-    rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
-    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
-    allowance_total = max(total_item_discount + float(getattr(doc, "discount_amount", 0) or 0), 0.0)
-
-    parts = []
-    parts += [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"',
-        '         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"',
-        '         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">',
-        '  <cbc:ProfileID>reporting:1.0</cbc:ProfileID>',
-        f'  <cbc:ID>{invoice_id}</cbc:ID>',
-        f'  <cbc:UUID>{uuid}</cbc:UUID>',
-        f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
-        f'  <cbc:InvoiceTypeCode listAgencyName="UN/CEFACT" listAgencyID="6" listID="UNCL1001" listVersionID="D16B">{inv_code}</cbc:InvoiceTypeCode>',
-        f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
-        f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
-        "",
-        # Seller
-        "  <cac:AccountingSupplierParty>",
-        "    <cac:Party>",
-        "      <cac:PartyTaxScheme>",
-        f"        <cbc:CompanyID>{frappe.utils.escape_html(supplier_tax)}</cbc:CompanyID>",
-        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-        "      </cac:PartyTaxScheme>",
-        "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{frappe.utils.escape_html(supplier_name)}</cbc:RegistrationName>",
-        "      </cac:PartyLegalEntity>",
-        "    </cac:Party>",
-        "  </cac:AccountingSupplierParty>",
-        "",
-        # Buyer
-        "  <cac:AccountingCustomerParty>",
-        "    <cac:Party>",
-    ]
-    if buyer_id:
-        parts += [
-            "      <cac:PartyIdentification>",
-            f'        <cbc:ID schemeID="{buyer_scheme}">{frappe.utils.escape_html(buyer_id)}</cbc:ID>',
-            "      </cac:PartyIdentification>",
-        ]
-    parts += [
-        "      <cac:PostalAddress>",
-        f"        <cbc:PostalZone>{frappe.utils.escape_html(postal_code)}</cbc:PostalZone>",
-        "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
-        "      </cac:PostalAddress>",
-        "      <cac:PartyTaxScheme>",
-        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-        "      </cac:PartyTaxScheme>",
-        "      <cac:PartyLegalEntity>",
-        f"        <cbc:RegistrationName>{frappe.utils.escape_html(customer_name)}</cbc:RegistrationName>",
-        "      </cac:PartyLegalEntity>",
-        "    </cac:Party>",
-        "  </cac:AccountingCustomerParty>",
-        "",
-        # إجمالي الضريبة
-        "  <cac:TaxTotal>",
-        f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
-        "    <cac:TaxSubtotal>",
-        f'      <cbc:TaxableAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxableAmount>',
-        f'      <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
-        "      <cac:TaxCategory>",
-        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-        "      </cac:TaxCategory>",
-        "    </cac:TaxSubtotal>",
-        "  </cac:TaxTotal>",
-        "",
-        # الخصومات + الإجماليات (مع التقريب)
-        "  <cac:AllowanceCharge>",
-        "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
-        "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
-        f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
-        "  </cac:AllowanceCharge>",
-        "  <cac:LegalMonetaryTotal>",
-        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
-        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:TaxExclusiveAmount>',
-        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(grand_total, 3)}</cbc:TaxInclusiveAmount>',
-        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:AllowanceTotalAmount>',
-        f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>',
-        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(rounded_total, 3)}</cbc:PayableAmount>',
-        "  </cac:LegalMonetaryTotal>",
-        "",
-        lines_xml,
-        "</Invoice>",
-    ]
-    return "\n".join(parts)
-
-
-# =========================
-# واجهة موحّدة لاختيار النوع
-# =========================
-
-def generate_ubl_xml(doc) -> str:
-    """يختار Income أو Sales حسب الإعداد أو يحاول Income أولاً."""
-    s = _get_settings()
-    template = (getattr(s, "invoice_template", None) or "").strip().lower()
-    if template == "sales":
-        return generate_ubl_xml_sales(doc)
-    # default: income
-    return generate_ubl_xml_income(doc)
-
-
-# =========================
-# Hook: إرسال عند الاعتماد
-# =========================
-
-def on_submit_send(doc, method=None):
-    s = _get_settings()
-
-    if not s.get("send_on_submit"):
-        return
-    if getattr(doc, "is_return", 0):
-        return
-
-    try:
-        ensure_custom_fields()
-
-        def _build_payload(_doc):
-            xml_str = getattr(_doc, "jofotara_xml", None) or generate_ubl_xml(_doc)
-            if not xml_str:
-                frappe.throw(_("Missing UBL XML (field jofotara_xml). Please generate UBL 2.1 and try again."))
-            xml_min = _minify_xml(xml_str)
-            xml_bytes = xml_min.encode("utf-8")
-            return {"payload": {"invoice": base64.b64encode(xml_bytes).decode()}, "xml_min": xml_min}
-
-        data = _build_payload(doc)
-        url = _full_url(getattr(s, "base_url", ""), getattr(s, "submit_url", "/core/invoices/") or "/core/invoices/")
-        headers = _build_headers(s)
-
-        if frappe.conf.get("developer_mode"):
-            try:
-                frappe.log_error(message=f"Outgoing UBL (first 800 chars):\n{data['xml_min'][:800]}",
-                                 title="JoFotara DEBUG - Outgoing XML")
-            except Exception:
-                pass
-
-        r = requests.post(url, json=data["payload"], headers=headers, timeout=90)
-
-        # جرّب Sales تلقائياً لو رسالة عدم السماح بنوع الفاتورة
-        need_retry_as_sales = False
-        if r.status_code >= 400:
-            try:
-                j = r.json()
-                msg = frappe.as_json(j)
-                if "not authorized to submit this type of invoice" in msg.lower():
-                    need_retry_as_sales = True
-            except Exception:
-                pass
-
-        if need_retry_as_sales:
-            xml_sales = generate_ubl_xml_sales(doc)
-            xml_min = _minify_xml(xml_sales)
-            payload = {"invoice": base64.b64encode(xml_min.encode("utf-8")).decode()}
-            r = requests.post(url, json=payload, headers=headers, timeout=90)
-
-        if r.status_code >= 400:
-            detail = r.text
-            try:
-                detail = frappe.as_json(r.json(), indent=2)
-            except Exception:
-                pass
-
-            frappe.log_error(
-                message=(
-                    f"URL: {url}\n"
-                    f"Status: {r.status_code}\n"
-                    f"Request Headers (masked): {frappe.as_json(_mask_headers(headers))}\n"
-                    f"Payload keys: ['invoice']\n"
-                    f"Response Body:\n{detail}"
-                ),
-                title="JoFotara API Error",
-            )
-            raise frappe.ValidationError(_("JoFotara API error {0}. See Error Log for details.").format(r.status_code))
-
-        resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
-
-        handle_submit_response(doc, resp)
-        frappe.msgprint(_("JoFotara: Invoice submitted successfully"), alert=1, indicator="green")
-
-    except Exception:
-        ensure_custom_fields()
         if doc.meta.has_field("jofotara_status"):
-            doc.db_set("jofotara_status", "Error")
-        frappe.log_error(frappe.get_traceback(), "JoFotara Submit Error")
-        raise
+            doc.db_set("jofotara_status", status)
+        if err and doc.meta.has_field("jofotara_error"):
+            doc.db_set("jofotara_error", err[:1000])
+    except Exception:
+        # ما نوقف التنفيذ بسبب فشل تحديث حالة العرض فقط
+        pass
 
 
-# =========================
-# معالجة الرد
-# =========================
-
-def handle_submit_response(doc, resp: dict):
-    ensure_custom_fields()
-
-    uuid = ((resp or {}).get("uuid") or (resp or {}).get("invoiceUUID") or
-            (resp or {}).get("invoice_uuid") or (resp or {}).get("id"))
-    qr = ((resp or {}).get("qr") or (resp or {}).get("qrCode") or
-          (resp or {}).get("qr_code") or (resp or {}).get("qrcode"))
-
-    blob = frappe.as_json(resp) if isinstance(resp, (dict, list)) else str(resp or "")
-    status = "Submitted" if (uuid or qr or "success" in blob.lower()) else "Error"
-
-    if doc.meta.has_field("jofotara_status"):
-        doc.db_set("jofotara_status", status)
-    if uuid and doc.meta.has_field("jofotara_uuid"):
-        doc.db_set("jofotara_uuid", uuid)
-    if qr and doc.meta.has_field("jofotara_qr"):
-        doc.db_set("jofotara_qr", qr)
+def _apply_response_to_invoice(doc, resp: Dict[str, Any]) -> None:
+    """مطابقة رد JoFotara وتخزين UUID/QR + الختم الزمني."""
+    uuid = (
+        resp.get("EINV_INV_UUID")
+        or resp.get("UUID")
+        or resp.get("invoice_uuid")
+        or resp.get("invoiceUUID")
+        or resp.get("id")
+        or ""
+    )
+    qr = (
+        resp.get("EINV_QR")
+        or resp.get("qr")
+        or resp.get("qrCode")
+        or resp.get("qr_code")
+        or ""
+    )
 
     try:
-        doc.add_comment("Comment", text=frappe.as_json(resp, indent=2))
+        if uuid and doc.meta.has_field("jofotara_uuid"):
+            doc.db_set("jofotara_uuid", uuid)
+        if qr and doc.meta.has_field("jofotara_qr"):
+            doc.db_set("jofotara_qr", qr)
+        if doc.meta.has_field("jofotara_sent_at"):
+            doc.db_set("jofotara_sent_at", now())
     except Exception:
         pass
 
+    # حدّث الحالة
+    _set_status(doc, "Success" if uuid or qr else "Error")
+
+    # أضف تعليقًا بنص الرد (مفيد للرجوع)
+    try:
+        doc.add_comment("Comment", text=json.dumps(resp, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+    # خزّن معاينة الرد في Settings
+    _store_response_preview_in_settings(resp)
+
+
+# =========================
+# Public API
+# =========================
 
 @frappe.whitelist()
-def retry_pending_jobs():
-    pass
+def send_now(name: str) -> Dict[str, Any]:
+    """
+    إرسال فاتورة Sales Invoice واحدة إلى JoFotara يدويًا.
+    المتطلبات حسب الدليل:
+      - XML بصيغة UBL 2.1
+      - تحويل Base64
+      - POST إلى /core/invoices/ مع {"invoice":"<b64>"}
+      - رؤوس: Client-Id, Secret-Key, Content-Type: application/json
+    """
+    # 1) إحضار الفاتورة
+    doc = frappe.get_doc("Sales Invoice", name)
+
+    # 2) توليد XML (يُفترض أن build_invoice_xml يراعي 388 للفاتورة و381 للإشعار الدائن)
+    xml = build_invoice_xml(doc.name)
+    if not xml:
+        frappe.throw(_("Failed to build UBL 2.1 XML for this invoice."))
+
+    # 3) تحسين بسيط ثم Base64
+    xml_min = _minify_xml(xml)
+    b64 = to_b64(xml_min)
+
+    # 4) الإرسال عبر عميل HTTP (يراعي الإعدادات والرؤوس حسب الدليل)
+    try:
+        resp = post_invoice(b64)
+    except Exception as e:
+        # سجّل الخطأ على الفاتورة للشفافية
+        _set_status(doc, "Error", err=str(e))
+        frappe.log_error(frappe.get_traceback(), "JoFotara Send Now Error")
+        raise
+
+    # 5) تطبيق الرد على الفاتورة
+    _apply_response_to_invoice(doc, resp)
+
+    # 6) رسالة تأكيد لطيفة
+    frappe.msgprint(_("JoFotara: Invoice submitted successfully."), alert=1, indicator="green")
+    return resp
+
+
+def on_submit_sales_invoice(doc, method: str | None = None) -> None:
+    """
+    Hook يُستدعى عند اعتماد Sales Invoice.
+    - لو JoFotara Settings فيه auto_send_on_submit = 1 → يرسل مباشرة.
+    - يتجنب الإرسال لو الفاتورة مرتجعة ولكن المنطق التفصيلي (381) يجب أن يكون في build_invoice_xml.
+    """
+    try:
+        s = _get_settings()
+        if not getattr(s, "auto_send_on_submit", 0):
+            return
+
+        # أرسل الآن
+        send_now(doc.name)
+
+    except Exception as e:
+        # لا نكسر دورة الاعتماد بسبب التكامل؛ نسجل الخطأ ونحدّث الحالة فقط
+        _set_status(doc, "Error", err=str(e))
+        frappe.log_error(frappe.get_traceback(), "JoFotara on_submit error")
