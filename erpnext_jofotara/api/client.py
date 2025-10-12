@@ -34,12 +34,11 @@ def _mask_headers(h: dict) -> dict:
 def _build_headers(s) -> dict:
     """
     يبني رؤوس JoFotara:
-      - Client-Id / Secret-Key
-      - Accept / Content-Type JSON
-    ويدعم طريقتين:
-      1) OAuth2 مفعّل -> يستخدم client_id/secret_key
-      2) OAuth2 غير مفعّل -> يستخدم device_user/device_secret كبديل
+      - Client-Id / Secret-Key (أو Alt Auth بالـ Device)
+      - Activity-Number أرقام فقط (1..15)
     """
+    import re
+
     use_oauth2 = int(getattr(s, "use_oauth2", 0) or 0)
 
     client_id = (getattr(s, "client_id", None) or "").strip()
@@ -49,11 +48,9 @@ def _build_headers(s) -> dict:
     device_secret = (s.get_password("device_secret", raise_exception=False) or "").strip()
 
     if use_oauth2:
-        # لازم Client ID/Secret
         if not client_id or not client_secret:
             frappe.throw("JoFotara Settings: الرجاء تعبئة Client ID و Secret Key (Enable OAuth2 مفعّل).")
     else:
-        # Alt Auth (Device) بديل لو Client ID/Secret ناقصين
         if not client_id and device_user:
             client_id = device_user
         if not client_secret and device_secret:
@@ -62,21 +59,24 @@ def _build_headers(s) -> dict:
     if not client_id or not client_secret:
         frappe.throw("JoFotara Settings: وفّر Client ID/Secret أو Device User/Secret.")
 
+    # ✅ تنسيق Activity-Number: أرقام فقط 1..15
+    raw_activity = (getattr(s, "activity_number", None) or "").strip()
+    activity = re.sub(r"\D", "", raw_activity)
+    if not (1 <= len(activity) <= 15):
+        frappe.throw("JoFotara Settings: Activity Number مطلوب، أرقام فقط، من 1 إلى 15 رقم.")
+
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Accept-Language": "ar",
         "Client-Id": client_id,
         "Secret-Key": client_secret,
+        "Activity-Number": activity,
+        "Key": activity,  # بعض البيئات تتوقعه كـ Key أيضًا
     }
 
-    # رؤوس اختيارية
-    activity = (getattr(s, "activity_number", None) or "").strip()
-    if activity:
-        headers["Activity-Number"] = activity
-        headers["Key"] = activity  # بعض البيئات تتوقعه
-
     return headers
+
 
 
 # =========================
