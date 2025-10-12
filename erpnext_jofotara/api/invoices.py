@@ -157,3 +157,8 @@ def on_submit_sales_invoice(doc, method: str | None = None) -> None:
         # لا نكسر دورة الاعتماد بسبب التكامل؛ نسجل الخطأ ونحدّث الحالة فقط
         _set_status(doc, "Error", err=str(e))
         frappe.log_error(frappe.get_traceback(), "JoFotara on_submit error")
+
+# Backward-compatible alias to match old hooks
+def on_submit_send(doc, method=None):
+    return on_submit_sales_invoice(doc, method)
+
