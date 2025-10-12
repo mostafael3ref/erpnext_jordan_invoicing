@@ -139,26 +139,37 @@ def send_now(name: str) -> Dict[str, Any]:
     return resp
 
 
+# ... نفس الملف اللي عندك تمامًا حتى دالة send_now ...
+
 def on_submit_sales_invoice(doc, method: str | None = None) -> None:
     """
     Hook يُستدعى عند اعتماد Sales Invoice.
-    - لو JoFotara Settings فيه auto_send_on_submit = 1 → يرسل مباشرة.
-    - يتجنب الإرسال لو الفاتورة مرتجعة ولكن المنطق التفصيلي (381) يجب أن يكون في build_invoice_xml.
+    يدعم الاسمين: send_on_submit و auto_send_on_submit.
     """
     try:
         s = _get_settings()
-        if not getattr(s, "auto_send_on_submit", 0):
+
+        enabled = 0
+        for fname in ("send_on_submit", "auto_send_on_submit"):
+            if getattr(s, fname, None):
+                enabled = int(getattr(s, fname) or 0)
+                break
+
+        if not enabled:
             return
 
-        # أرسل الآن
         send_now(doc.name)
 
     except Exception as e:
-        # لا نكسر دورة الاعتماد بسبب التكامل؛ نسجل الخطأ ونحدّث الحالة فقط
         _set_status(doc, "Error", err=str(e))
         frappe.log_error(frappe.get_traceback(), "JoFotara on_submit error")
 
-# Backward-compatible alias to match old hooks
+# Backward-compatible alias
 def on_submit_send(doc, method=None):
     return on_submit_sales_invoice(doc, method)
+
+@frappe.whitelist()
+def retry_pending_jobs():
+    # TODO: implement retries if needed
+    pass
 
