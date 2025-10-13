@@ -12,7 +12,6 @@ __all__ = ["build_invoice_xml"]
 INVOICE = "388"      # New invoice
 CREDIT_NOTE = "381"  # Credit note
 
-
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
         return f"{float(n):.{places}f}"
