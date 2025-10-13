@@ -312,7 +312,7 @@ def build_invoice_xml(name: str) -> str:
         A('  <cac:InvoiceLine>')
         A(f'    <cbc:ID>{l["idx"]}</cbc:ID>')
         A(f'    <cbc:InvoicedQuantity unitCode="{l["uom"]}">{_fmt(l["qty"], 3)}</cbc:InvoicedQuantity>')
-        A(f'    <cbc:LineExtensionAmount currencyID="{CURRENCY}">{_fmt(l{"line_net"], 3)}</cbc:LineExtensionAmount>')
+        A(f'    <cbc:LineExtensionAmount currencyID="{CURRENCY}">{_fmt(l["line_net"], 3)}</cbc:LineExtensionAmount>')
 
         # AllowanceCharge (discount at line level)
         if l["discount"] > 0:
