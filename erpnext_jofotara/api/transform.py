@@ -21,7 +21,6 @@ def _fmt(n: float | Decimal, places: int = 3) -> str:
 
 
 def _uom_code(uom: str | None) -> str:
-    """Map ERPNext UOM to UBL unitCode; default PCE."""
     if not uom:
         return "PCE"
     key = (uom or "").strip().lower()
@@ -61,7 +60,7 @@ def _buyer_info(doc) -> Tuple[str, str, str, str, str]:
     except Exception:
         pass
     buyer_id = (doc.tax_id or "").strip()
-    buyer_scheme = "TN" if buyer_id else ""  # عدّلها عند الحاجة
+    buyer_scheme = "TN" if buyer_id else ""
     return customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme
 
 
@@ -83,7 +82,6 @@ def _uuid_icv(doc) -> Tuple[str, int]:
 
 
 def _payment_method_name(doc) -> str:
-    # 011 = Cash, 021 = Credit
     is_cash = bool(getattr(doc, "is_pos", 0)) or (
         float(getattr(doc, "paid_amount", 0) or 0) >= float(getattr(doc, "grand_total", 0) or 0)
     )
@@ -100,7 +98,6 @@ def _tax_rate_from_doc(doc) -> float:
 
 
 def build_invoice_xml(si_name: str) -> str:
-    """يبني XML بصيغة UBL 2.1 لواجهة JoFotara. يدعم 388 و 381 تلقائيًا."""
     doc = frappe.get_doc("Sales Invoice", si_name)
 
     cur = (doc.currency or "JOD").upper()
@@ -115,11 +112,11 @@ def build_invoice_xml(si_name: str) -> str:
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
-    # نحتاج ActivityNumber من الإعدادات داخل XML
+    # ActivityNumber من الإعدادات لاستخدامه داخل XML
     s = frappe.get_single("JoFotara Settings")
     _activity = re.sub(r"\D", "", (getattr(s, "activity_number", "") or "").strip())
 
-    # السطور وحساب المجاميع
+    # ===== Lines =====
     line_ext_total = 0.0
     line_blocks = []
     tax_rate = _tax_rate_from_doc(doc)
@@ -128,13 +125,13 @@ def build_invoice_xml(si_name: str) -> str:
         qty = float(it.qty or 1)
         unit_price = float(it.rate or 0)
         line_discount = float(getattr(it, "discount_amount", 0) or 0)
-        net_line = (qty * unit_price) - line_discount   # صافي السطر بعد خصم السطر
+        net_line = (qty * unit_price) - line_discount
         line_ext_total += net_line
 
         uom = _uom_code(getattr(it, "uom", None))
         name = frappe.utils.escape_html(it.item_name or it.item_code or "Item")
 
-        # ⚠️ لا نضع AllowanceCharge على مستوى السطر لتفادي الخصم المزدوج
+        # مفيش AllowanceCharge على مستوى السطر
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
@@ -154,26 +151,23 @@ def build_invoice_xml(si_name: str) -> str:
             "  </cac:InvoiceLine>",
         ]))
 
-    # أرقام ERP الحقيقية إن وُجدت
+    # ===== Totals =====
     net_total = float(getattr(doc, "net_total", 0) or line_ext_total)
 
-    # خصم المستند فقط (document-level)
     document_discount = float(getattr(doc, "discount_amount", 0) or 0.0)
     allowance_total = max(document_discount, 0.0)
 
-    # القاعدة الخاضعة للضريبة = صافي السطور - خصم المستند
     taxable_base = max(net_total - allowance_total, 0.0)
 
-    # الضريبة: ERP إن وُجدت، وإلا احسب على القاعدة بعد الخصم
     tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (taxable_base * tax_rate / 100.0))
 
-    # الإجماليات
     grand_total = float(getattr(doc, "grand_total", 0) or (taxable_base + tax_total))
     rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
     rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
 
     lines_xml = "\n".join(line_blocks)
 
+    # ===== XML =====
     parts = []
     parts += [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -196,7 +190,7 @@ def build_invoice_xml(si_name: str) -> str:
         # Seller
         "  <cac:AccountingSupplierParty>",
         "    <cac:Party>",
-        # ✅ ActivityNumber داخل المورد
+        # ActivityNumber داخل المورد
         "      <cac:PartyIdentification>",
         f"        <cbc:ID schemeID=\"ActivityNumber\">{frappe.utils.escape_html(_activity)}</cbc:ID>",
         "      </cac:PartyIdentification>",
@@ -242,7 +236,7 @@ def build_invoice_xml(si_name: str) -> str:
         ""
     ]
 
-    # ✅ AllowanceCharge على مستوى المستند (إن وُجد خصم مستندي)
+    # AllowanceCharge (document-level)
     if allowance_total and allowance_total != 0:
         parts += [
             "  <cac:AllowanceCharge>",
@@ -253,7 +247,7 @@ def build_invoice_xml(si_name: str) -> str:
             ""
         ]
 
-    # ✅ TaxTotal: TaxableAmount = taxable_base
+    # TaxTotal
     if tax_total and tax_total != 0:
         parts += [
             "  <cac:TaxTotal>",
@@ -269,7 +263,7 @@ def build_invoice_xml(si_name: str) -> str:
             ""
         ]
 
-    # ✅ LegalMonetaryTotal
+    # LegalMonetaryTotal
     parts += [
         "  <cac:LegalMonetaryTotal>",
         f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
