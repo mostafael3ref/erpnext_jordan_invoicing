@@ -82,8 +82,7 @@ def _uuid_icv(doc) -> Tuple[str, int]:
 
 
 def _payment_method_name(doc, taxed: bool) -> str:
-    """
-    فوترة الأردن:
+    """فوترة الأردن:
       - دخل (بدون ضريبة عامة): 011 نقدي / 021 غير نقدي
       - مبيعات عامة (مع ضريبة عامة): 012 نقدي / 022 غير نقدي
     """
@@ -132,22 +131,18 @@ def build_invoice_xml(si_name: str) -> str:
 
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
-
     activity_number = _get_activity_number()
 
-    # ===== Lines: حضّر بيانات البنود أولاً لنوزّع خصم المستند (إن وجد) =====
+    # ===== Lines =====
     raw_lines: List[Dict] = []
-    sum_after_item_disc = 0.0  # مجموع (qty * rate بعد خصم البند)
+    sum_after_item_disc = 0.0
 
     for it in (doc.items or []):
         qty = float(it.qty or 1.0)
-
-        unit_after = float(it.rate or 0.0)  # بعد خصم البند
+        unit_after = float(it.rate or 0.0)
         unit_before = float(getattr(it, "price_list_rate", unit_after) or unit_after)
-
         per_unit_item_disc = max(unit_before - unit_after, 0.0)
         base_after_item_disc = qty * unit_after
-
         raw_lines.append({
             "qty": qty,
             "uom": _uom_code(getattr(it, "uom", None)),
@@ -158,11 +153,9 @@ def build_invoice_xml(si_name: str) -> str:
         })
         sum_after_item_disc += base_after_item_disc
 
-    # خصم المستند — إن كان ضريبيًا نوزعه على البنود (ولا نرسل AllowanceCharge على مستوى المستند)
     document_discount = float(getattr(doc, "discount_amount", 0) or 0.0)
     distribute_doc_disc = is_taxed and document_discount > 0.0
 
-    # جهّز البنود النهائية بعد التوزيع
     line_blocks = []
     line_ext_total = 0.0
 
@@ -170,18 +163,13 @@ def build_invoice_xml(si_name: str) -> str:
         qty = ln["qty"]
         unit_before = ln["unit_before"]
         per_unit_item_disc = ln["per_unit_item_disc"]
-
         per_unit_doc_disc = 0.0
         if distribute_doc_disc and sum_after_item_disc > 0:
             share = document_discount * (ln["base_after_item_disc"] / sum_after_item_disc)
             per_unit_doc_disc = share / qty
-
-        # السعر النهائي لكل وحدة بعد جميع الخصومات
         unit_final = max(unit_before - per_unit_item_disc - per_unit_doc_disc, 0.0)
         net_line = unit_final * qty
         line_ext_total += net_line
-
-        # price block + allowancecharges (خصم البند + خصم المستند الموزع)
         price_xml = [
             "    <cac:Price>",
             f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(unit_before, 3)}</cbc:PriceAmount>',
@@ -203,7 +191,6 @@ def build_invoice_xml(si_name: str) -> str:
                 "      </cac:AllowanceCharge>",
             ]
         price_xml += ["    </cac:Price>"]
-
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
@@ -222,20 +209,11 @@ def build_invoice_xml(si_name: str) -> str:
         ]))
 
     # ===== Totals =====
-    # نخلي الحسابات من السطور لضمان التطابق مع المدقق
     net_total = line_ext_total
-
-    # AllowanceCharge على مستوى المستند: فقط لغير الضريبي
     allowance_total = 0.0 if is_taxed else max(document_discount, 0.0)
-
     taxable_base = max(net_total - allowance_total, 0.0)
-
-    tax_total = 0.0
-    if is_taxed:
-        tax_total = taxable_base * (tax_rate / 100.0)
-
+    tax_total = taxable_base * (tax_rate / 100.0) if is_taxed else 0.0
     inclusive_total = taxable_base + tax_total
-
     grand_total = float(getattr(doc, "grand_total", 0) or inclusive_total)
     rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
     rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
@@ -257,29 +235,20 @@ def build_invoice_xml(si_name: str) -> str:
         f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
         f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
         f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
-
-        # ICV
         "  <cac:AdditionalDocumentReference>",
         "    <cbc:ID>ICV</cbc:ID>",
         f"    <cbc:UUID>{icv}</cbc:UUID>",
         "  </cac:AdditionalDocumentReference>",
-
         "",
-        # ✅ ActivityNumber في المكان المعتمد داخل هوية المورد
-        "  <cac:SellerSupplierParty>",
-        "    <cac:Party>",
-        "      <cac:PartyIdentification>",
-        f"        <cbc:ID>{frappe.utils.escape_html(activity_number)}</cbc:ID>",
-        "      </cac:PartyIdentification>",
-        "    </cac:Party>",
-        "  </cac:SellerSupplierParty>",
-        "",
-        # Seller
+        # ✅ ActivityNumber داخل AccountingSupplierParty
         "  <cac:AccountingSupplierParty>",
         "    <cac:Party>",
         "      <cac:PostalAddress>",
         "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
         "      </cac:PostalAddress>",
+        "      <cac:PartyIdentification>",
+        f'        <cbc:ID schemeID="ActivityNumber">{frappe.utils.escape_html(activity_number)}</cbc:ID>',
+        "      </cac:PartyIdentification>",
         "      <cac:PartyTaxScheme>",
         f"        <cbc:CompanyID>{frappe.utils.escape_html(supplier_tax)}</cbc:CompanyID>",
         "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
@@ -316,7 +285,7 @@ def build_invoice_xml(si_name: str) -> str:
         f"      <cbc:Telephone>{frappe.utils.escape_html(buyer_phone)}</cbc:Telephone>",
         "    </cac:AccountingContact>",
         "  </cac:AccountingCustomerParty>",
-        ""
+        "",
     ]
 
     # AllowanceCharge document-level فقط لغير الضريبي
@@ -327,16 +296,16 @@ def build_invoice_xml(si_name: str) -> str:
             "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
             f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
             "  </cac:AllowanceCharge>",
-            ""
+            "",
         ]
 
-    # TaxTotal — إجمالي الضريبة العامة
+    # TaxTotal
     if is_taxed:
         parts += [
             "  <cac:TaxTotal>",
             f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
             "  </cac:TaxTotal>",
-            ""
+            "",
         ]
 
     # LegalMonetaryTotal
@@ -358,4 +327,3 @@ def build_invoice_xml(si_name: str) -> str:
     ]
 
     return "\n".join(parts)
-
