@@ -12,7 +12,6 @@ from frappe.utils import now
 from .client import post_invoice, to_b64  # post_invoice(b64xml) -> dict
 from .transform import build_invoice_xml   # build_invoice_xml(sales_invoice_name) -> xml string
 
-
 # =========================
 # Utilities
 # =========================
