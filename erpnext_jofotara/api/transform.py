@@ -204,6 +204,24 @@ def build_invoice_xml(si_name: str) -> str:
             ]
         price_xml += ["    </cac:Price>"]
 
+        # Tax category at line (UBL requires ClassifiedTaxCategory)
+        if is_taxed:
+            tax_cat_xml = [
+                "      <cac:ClassifiedTaxCategory>",
+                "        <cbc:ID>S</cbc:ID>",
+                f"        <cbc:Percent>{_fmt(tax_rate, 3)}</cbc:Percent>",
+                "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
+                "      </cac:ClassifiedTaxCategory>",
+            ]
+        else:
+            # غير خاضع — أرسل TaxScheme على الأقل لتفادي أخطاء XSD
+            tax_cat_xml = [
+                "      <cac:ClassifiedTaxCategory>",
+                "        <cbc:ID>O</cbc:ID>",
+                "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
+                "      </cac:ClassifiedTaxCategory>",
+            ]
+
         line_blocks.append("\n".join([
             "  <cac:InvoiceLine>",
             f"    <cbc:ID>{idx}</cbc:ID>",
@@ -211,18 +229,13 @@ def build_invoice_xml(si_name: str) -> str:
             f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_line, 3)}</cbc:LineExtensionAmount>',
             "    <cac:Item>",
             f"      <cbc:Name>{ln['name']}</cbc:Name>",
-            "      <cac:ClassifiedTaxCategory>",
-            "        <cbc:ID>S</cbc:ID>",
-            f"        <cbc:Percent>{_fmt(tax_rate, 3)}</cbc:Percent>",
-            "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
-            "      </cac:ClassifiedTaxCategory>",
+            *tax_cat_xml,
             "    </cac:Item>",
             *price_xml,
             "  </cac:InvoiceLine>",
         ]))
 
     # ===== Totals =====
-    # نخلي الحسابات من السطور لضمان التطابق مع المدقق
     net_total = line_ext_total
 
     # AllowanceCharge على مستوى المستند: فقط لغير الضريبي
@@ -265,7 +278,7 @@ def build_invoice_xml(si_name: str) -> str:
         "  </cac:AdditionalDocumentReference>",
 
         "",
-        # ✅ ActivityNumber في المكان المعتمد داخل هوية المورد
+        # ✅ ActivityNumber داخل SellerSupplierParty/PartyIdentification
         "  <cac:SellerSupplierParty>",
         "    <cac:Party>",
         "      <cac:PartyIdentification>",
@@ -330,11 +343,20 @@ def build_invoice_xml(si_name: str) -> str:
             ""
         ]
 
-    # TaxTotal — إجمالي الضريبة العامة
+    # ===== TaxTotal with TaxSubtotal (يشمل TaxCategory الكامل) =====
     if is_taxed:
         parts += [
             "  <cac:TaxTotal>",
             f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
+            "    <cac:TaxSubtotal>",
+            f'      <cbc:TaxableAmount currencyID="{cur}">{_fmt(taxable_base, 3)}</cbc:TaxableAmount>',
+            f'      <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
+            "      <cac:TaxCategory>",
+            "        <cbc:ID>S</cbc:ID>",
+            f"        <cbc:Percent>{_fmt(tax_rate, 3)}</cbc:Percent>",
+            "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
+            "      </cac:TaxCategory>",
+            "    </cac:TaxSubtotal>",
             "  </cac:TaxTotal>",
             ""
         ]
@@ -358,4 +380,3 @@ def build_invoice_xml(si_name: str) -> str:
     ]
 
     return "\n".join(parts)
-
