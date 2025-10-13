@@ -1,391 +1,361 @@
 # erpnext_jofotara/api/transform.py
 from __future__ import annotations
 
+import re
 from decimal import Decimal
-from typing import Tuple, List, Dict, Any
-import uuid as _uuid
+from typing import Tuple, List, Dict
 
 import frappe
-from frappe.utils import getdate
 
 __all__ = ["build_invoice_xml"]
 
-# ---------------------------
-# ثوابت حسب الدليل
-# ---------------------------
-INVOICE = "388"      # فاتورة جديدة
-CREDIT_NOTE = "381"  # إشعار دائن
+INVOICE = "388"      # New invoice
+CREDIT_NOTE = "381"  # Credit note
 
-CURRENCY = "JOD"
-TAX_CURRENCY = "JOD"
 
-NSMAP = {
-    "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
-    "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
-    "inv": "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2",
-}
-
-# ---------------------------
-# Utilities
-# ---------------------------
-
-def _fmt(n: Any, places: int = 3) -> str:
-    """تنسيق أرقام آمن."""
+def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
         return f"{float(n):.{places}f}"
     except Exception:
         return f"{0.0:.{places}f}"
 
-def _dec(x: Any) -> Decimal:
-    try:
-        return Decimal(str(x or "0"))
-    except Exception:
-        return Decimal("0")
 
 def _uom_code(uom: str | None) -> str:
-    """تحويل وحدات شائعة إلى رمز قياسي (PCE = قطعة)."""
     if not uom:
         return "PCE"
     key = (uom or "").strip().lower()
     mapping = {
         "unit": "PCE", "units": "PCE", "each": "PCE", "pcs": "PCE", "piece": "PCE", "nos": "PCE",
         "وحدة": "PCE", "قطعة": "PCE",
-        "kg": "KGM", "g": "GRM", "m": "MTR", "cm": "CMT", "mm": "MMT", "box": "BX",
-        "m2": "MTK", "m²": "MTK", "sqm": "MTK",
-        "l": "LTR", "lt": "LTR", "liter": "LTR",
+        "kg": "KGM", "kilogram": "KGM", "كيلو": "KGM",
+        "g": "GRM", "gram": "GRM",
+        "l": "LTR", "lt": "LTR", "liter": "LTR", "لتر": "LTR",
+        "ml": "MLT",
+        "m": "MTR", "meter": "MTR", "متر": "MTR",
+        "cm": "CMT", "mm": "MMT",
+        "hour": "HUR", "ساعة": "HUR",
+        "day": "DAY", "يوم": "DAY",
+        "month": "MON", "شهر": "MON",
+        "year": "ANN", "سنة": "ANN",
     }
     return mapping.get(key, "PCE")
 
-def _get_settings():
-    return frappe.get_single("JoFotara Settings")
 
-def _uuid_icv(doc) -> Tuple[str, str]:
-    """
-    يولّد/يستنتج:
-      - UUID (فريد للفاتورة) — إن لم يوجد بالحقل.
-      - ICV عدّاد تسلسلي (إن لم يوجد حقل عندك نستخدم رقم من الاسم).
-    لو عندك حقول مخصصة jofotara_uuid / jofotara_icv سيأخذها أولاً.
-    """
-    # UUID
-    uuid_val = ""
-    for fn in ("jofotara_uuid", "uuid", "einv_uuid"):
-        if doc.meta.has_field(fn) and getattr(doc, fn, None):
-            uuid_val = str(getattr(doc, fn))
-            break
-    if not uuid_val:
-        uuid_val = str(_uuid.uuid4())
+def _seller_info(doc) -> Tuple[str, str]:
+    supplier_name = frappe.db.get_value("Company", doc.company, "company_name") or doc.company
+    tax_raw = (doc.company_tax_id or frappe.db.get_value("Company", doc.company, "tax_id") or "").strip()
+    tax_num = re.sub(r"\D", "", tax_raw)
+    if not (1 <= len(tax_num) <= 15):
+        frappe.throw(f"Seller Tax Number is required (1-15 digits). Current: '{tax_raw}'")
+    return supplier_name, tax_num
 
-    # ICV
-    icv = ""
-    for fn in ("jofotara_icv", "icv", "invoice_counter"):
-        if doc.meta.has_field(fn) and getattr(doc, fn, None):
-            icv = str(getattr(doc, fn))
-            break
-    if not icv:
-        # استنتاج بسيط من الاسم (أرقام فقط)، وإلا 1
-        import re
-        nums = "".join(re.findall(r"\d+", doc.name or ""))
-        icv = nums or "1"
 
-    return uuid_val, icv
-
-def _is_cash_invoice(doc) -> bool:
-    """
-    تحديد طريقة الدفع لتعبئة name في InvoiceTypeCode:
-      011 نقدي / 021 آجل (عامّة)
-    دالة بسيطة: لو mode_of_payment موجود أو paid_amount≥outstanding تُعتبر نقدي.
-    """
+def _buyer_info(doc) -> Tuple[str, str, str, str, str]:
+    customer_name = (doc.customer_name or doc.customer or "").strip()
+    buyer_phone = (getattr(doc, "contact_mobile", None) or getattr(doc, "contact_phone", None) or "").strip()
+    postal_code = ""
     try:
-        if getattr(doc, "is_pos", 0):
-            return True
-        if getattr(doc, "payments", None):
-            for p in doc.payments:
-                if (p.amount or 0) > 0:
-                    return True
-        paid = _dec(getattr(doc, "paid_amount", 0))
-        outstanding = _dec(getattr(doc, "outstanding_amount", 0))
-        if paid >= outstanding:
-            return True
+        if getattr(doc, "customer_address", None):
+            postal_code = frappe.db.get_value("Address", doc.customer_address, "pincode") or ""
     except Exception:
         pass
-    return False
+    buyer_id = (doc.tax_id or "").strip()
+    buyer_scheme = "TN" if buyer_id else ""
+    return customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme
 
-def _tax_category_and_rate(doc) -> Tuple[str, Decimal]:
-    """
-    استنتاج نوع الضريبة ونسبتها من بنود الضرائب في الفاتورة.
-    - category: S (خاضع) / Z (معفى) / O (صفرية)
-    - rate: النسبة %
-    """
-    rate = Decimal("0")
-    if getattr(doc, "taxes", None):
-        for tx in doc.taxes:
-            r = _dec(getattr(tx, "rate", 0))
-            if r > 0:
-                rate = r
-                break
 
-    if rate > 0:
-        return "S", rate
-    # لو rate==0 قد تكون صفرية أو معفاة — نضع افتراضي صفرية
-    return "O", Decimal("0")
+def _uuid_icv(doc) -> Tuple[str, int]:
+    uuid = (getattr(doc, "jofotara_uuid", None) or frappe.generate_hash(length=36))
+    try:
+        if not getattr(doc, "jofotara_uuid", None) and doc.meta.has_field("jofotara_uuid"):
+            doc.db_set("jofotara_uuid", uuid)
+    except Exception:
+        pass
 
-def _doc_type_and_name_attr(doc) -> Tuple[str, str]:
-    """
-    يحدد:
-      - cbc:InvoiceTypeCode (388/381)
-      - name attribute لقيمة الدفع (011 نقدي / 021 آجل)
-    """
-    itc = CREDIT_NOTE if getattr(doc, "is_return", 0) else INVOICE
-    name_attr = "011" if _is_cash_invoice(doc) else "021"
-    return itc, name_attr
+    icv = int(getattr(doc, "jofotara_icv", 0) or 1)
+    try:
+        if doc.meta.has_field("jofotara_icv") and not getattr(doc, "jofotara_icv", None):
+            doc.db_set("jofotara_icv", icv)
+    except Exception:
+        pass
+    return uuid, icv
 
-def _seller_info(doc) -> Tuple[str, str, str]:
-    """
-    يعيد: (registration_name, tax_number, activity_number)
-    يفضّل الحقول من JoFotara Settings.
-    """
-    s = _get_settings()
 
-    reg_name = (getattr(s, "seller_name", None) or getattr(doc, "company", None) or "Seller").strip()
-    tax_no = (getattr(s, "seller_tax_number", None) or getattr(doc, "tax_id", None) or "").strip()
-    activity = (getattr(s, "activity_number", None) or "").strip()
-
-    return reg_name, tax_no, activity
-
-def _customer_info(doc) -> Dict[str, str]:
+def _payment_method_name(doc, taxed: bool) -> str:
     """
-    محاولة جمع بيانات المشتري.
-    يعيد dict مثل: {"name": "...", "id": "...", "scheme": "TN"}
+    فوترة الأردن:
+      - دخل (بدون ضريبة عامة): 011 نقدي / 021 غير نقدي
+      - مبيعات عامة (مع ضريبة عامة): 012 نقدي / 022 غير نقدي
     """
-    name = (getattr(doc, "customer_name", None) or getattr(doc, "customer", None) or "عميل نقدي").strip()
-    # رقم تعريف المشتري (اختياري)
-    scheme = ""
-    cid = ""
+    is_cash = bool(getattr(doc, "is_pos", 0)) or (
+        float(getattr(doc, "paid_amount", 0) or 0) >= float(getattr(doc, "grand_total", 0) or 0)
+    )
+    if taxed:
+        return "012" if is_cash else "022"
+    return "011" if is_cash else "021"
 
-    # جرّب قراءة من الحقول الشائعة
-    for fn in ("customer_tax_id", "tax_id", "buyer_tax_no", "national_id", "vat_tin"):
-        val = getattr(doc, fn, None)
-        if val:
-            cid = str(val).strip()
+
+def _tax_rate_from_doc(doc) -> float:
+    rate = 0.0
+    for tx in (getattr(doc, "taxes", None) or []):
+        if (tx.rate or 0) > 0:
+            rate = float(tx.rate or 0)
             break
+    return rate
 
-    # إن وجد رقم ضريبي نفترض TN، وإلا فارغ
-    if cid:
-        scheme = "TN"
 
-    return {"name": name, "id": cid, "scheme": scheme}
+def _get_activity_number() -> str:
+    s = frappe.get_single("JoFotara Settings")
+    raw = (getattr(s, "activity_number", "") or "").strip()
+    activity = re.sub(r"\D", "", raw)
+    if not (1 <= len(activity) <= 15):
+        frappe.throw("JoFotara Settings: Activity Number is required and must be 1–15 digits (numbers only).")
+    return activity
 
-def _lines(doc) -> List[Dict[str, Any]]:
-    """تفاصيل البنود: السعر، الكمية، الضريبة، الخصم…"""
-    rows: List[Dict[str, Any]] = []
-    category, rate = _tax_category_and_rate(doc)
 
-    for i, d in enumerate(getattr(doc, "items", []) or [], start=1):
-        qty = _dec(getattr(d, "qty", 0))
-        rate_u = _dec(getattr(d, "rate", 0))
-        disc = _dec(getattr(d, "discount_amount", 0))
+def build_invoice_xml(si_name: str) -> str:
+    doc = frappe.get_doc("Sales Invoice", si_name)
 
-        # قيمة السطر قبل الضريبة وبعد الخصم
-        line_net = qty * rate_u - disc
-        if line_net < 0:
-            line_net = Decimal("0")
+    cur = (doc.currency or "JOD").upper()
+    issue_date = str(doc.posting_date)
+    note = (getattr(doc, "remarks", None) or getattr(doc, "po_no", None) or "").strip()
 
-        tax_amt = (line_net * rate / Decimal("100")) if rate > 0 else Decimal("0")
-        line_total = line_net + tax_amt
+    invoice_id = doc.name
+    uuid, icv = _uuid_icv(doc)
 
-        rows.append({
-            "idx": i,
-            "name": getattr(d, "item_name", None) or getattr(d, "item_code", None) or f"Item {i}",
+    # ضريبة؟
+    tax_rate = _tax_rate_from_doc(doc)
+    is_taxed = tax_rate > 0.0
+
+    inv_code = CREDIT_NOTE if getattr(doc, "is_return", 0) else INVOICE
+    inv_type_name = _payment_method_name(doc, taxed=is_taxed)
+
+    supplier_name, supplier_tax = _seller_info(doc)
+    customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
+
+    activity_number = _get_activity_number()
+
+    # ===== Lines: حضّر بيانات البنود أولاً لنوزّع خصم المستند (إن وجد) =====
+    raw_lines: List[Dict] = []
+    sum_after_item_disc = 0.0  # مجموع (qty * rate بعد خصم البند)
+
+    for it in (doc.items or []):
+        qty = float(it.qty or 1.0)
+
+        unit_after = float(it.rate or 0.0)  # بعد خصم البند
+        unit_before = float(getattr(it, "price_list_rate", unit_after) or unit_after)
+
+        per_unit_item_disc = max(unit_before - unit_after, 0.0)
+        base_after_item_disc = qty * unit_after
+
+        raw_lines.append({
             "qty": qty,
-            "uom": _uom_code(getattr(d, "uom", None)),
-            "rate": rate_u,
-            "discount": disc,
-            "line_net": line_net,
-            "tax_amount": tax_amt,
-            "line_total": line_total,
-            "tax_category": category,
-            "tax_rate": rate,
+            "uom": _uom_code(getattr(it, "uom", None)),
+            "name": frappe.utils.escape_html(it.item_name or it.item_code or "Item"),
+            "unit_before": unit_before,
+            "per_unit_item_disc": per_unit_item_disc,
+            "base_after_item_disc": base_after_item_disc,
         })
-    return rows
+        sum_after_item_disc += base_after_item_disc
 
-def _totals_from_lines(lines: List[Dict[str, Any]]) -> Dict[str, Decimal]:
-    net = sum((l["line_net"] for l in lines), Decimal("0"))
-    tax = sum((l["tax_amount"] for l in lines), Decimal("0"))
-    grand = net + tax
-    return {"net": net, "tax": tax, "grand": grand}
+    # خصم المستند — إن كان ضريبيًا نوزعه على البنود (ولا نرسل AllowanceCharge على مستوى المستند)
+    document_discount = float(getattr(doc, "discount_amount", 0) or 0.0)
+    distribute_doc_disc = is_taxed and document_discount > 0.0
 
-def _credit_note_reference(doc) -> str:
-    """
-    لو إشعار دائن، رجّع مرجع الفاتورة الأصلية (ID/UUID إن متوافر).
-    نستخدم الحقول الشائعة: return_against / amended_from + jofotara_uuid.
-    """
-    if not getattr(doc, "is_return", 0):
-        return ""
-    ref = ""
-    if getattr(doc, "return_against", None):
-        ref = str(doc.return_against)
-    elif getattr(doc, "amended_from", None):
-        ref = str(doc.amended_from)
-    return ref
+    # جهّز البنود النهائية بعد التوزيع
+    line_blocks = []
+    line_ext_total = 0.0
 
-# ---------------------------
-# XML Builder (يدويًا بسلاسل نصية)
-# ---------------------------
+    for idx, ln in enumerate(raw_lines, start=1):
+        qty = ln["qty"]
+        unit_before = ln["unit_before"]
+        per_unit_item_disc = ln["per_unit_item_disc"]
 
-def build_invoice_xml(name: str) -> str:
-    """
-    يبني XML بصيغة UBL 2.1 كما يطلب JoFotara.
-    يعتمد على Sales Invoice بالاسم (name).
-    """
-    doc = frappe.get_doc("Sales Invoice", name)
+        per_unit_doc_disc = 0.0
+        if distribute_doc_disc and sum_after_item_disc > 0:
+            share = document_discount * (ln["base_after_item_disc"] / sum_after_item_disc)
+            per_unit_doc_disc = share / qty
 
-    # رؤوس/تعريفات
-    invoice_type_code, name_attr = _doc_type_and_name_attr(doc)
-    issue_date = str(getdate(getattr(doc, "posting_date", getdate())))
-    note = (getattr(doc, "remarks", None) or getattr(doc, "note", None) or "").strip()
+        # السعر النهائي لكل وحدة بعد جميع الخصومات
+        unit_final = max(unit_before - per_unit_item_disc - per_unit_doc_disc, 0.0)
+        net_line = unit_final * qty
+        line_ext_total += net_line
 
-    inv_id = doc.name
-    uuid_val, icv = _uuid_icv(doc)
+        # price block + allowancecharges (خصم البند + خصم المستند الموزع)
+        price_xml = [
+            "    <cac:Price>",
+            f'      <cbc:PriceAmount currencyID="{cur}">{_fmt(unit_before, 3)}</cbc:PriceAmount>',
+        ]
+        if per_unit_item_disc > 0:
+            price_xml += [
+                "      <cac:AllowanceCharge>",
+                "        <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+                f'        <cbc:Amount currencyID="{cur}">{_fmt(per_unit_item_disc, 3)}</cbc:Amount>',
+                f'        <cbc:BaseAmount currencyID="{cur}">{_fmt(unit_before, 3)}</cbc:BaseAmount>',
+                "      </cac:AllowanceCharge>",
+            ]
+        if per_unit_doc_disc > 0:
+            price_xml += [
+                "      <cac:AllowanceCharge>",
+                "        <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+                f'        <cbc:Amount currencyID="{cur}">{_fmt(per_unit_doc_disc, 3)}</cbc:Amount>',
+                f'        <cbc:BaseAmount currencyID="{cur}">{_fmt(unit_before - per_unit_item_disc, 3)}</cbc:BaseAmount>',
+                "      </cac:AllowanceCharge>",
+            ]
+        price_xml += ["    </cac:Price>"]
 
-    # البائع والمشتري
-    seller_name, seller_tax, activity_no = _seller_info(doc)
-    cust = _customer_info(doc)
+        line_blocks.append("\n".join([
+            "  <cac:InvoiceLine>",
+            f"    <cbc:ID>{idx}</cbc:ID>",
+            f'    <cbc:InvoicedQuantity unitCode="{ln["uom"]}">{_fmt(qty, 2)}</cbc:InvoicedQuantity>',
+            f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_line, 3)}</cbc:LineExtensionAmount>',
+            "    <cac:Item>",
+            f"      <cbc:Name>{ln['name']}</cbc:Name>",
+            "      <cac:ClassifiedTaxCategory>",
+            "        <cbc:ID>S</cbc:ID>",
+            f"        <cbc:Percent>{_fmt(tax_rate, 3)}</cbc:Percent>",
+            "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
+            "      </cac:ClassifiedTaxCategory>",
+            "    </cac:Item>",
+            *price_xml,
+            "  </cac:InvoiceLine>",
+        ]))
 
-    # البنود والإجماليات
-    lines = _lines(doc)
-    totals = _totals_from_lines(lines)
-    tax_category, tax_rate = _tax_category_and_rate(doc)
+    # ===== Totals =====
+    # نخلي الحسابات من السطور لضمان التطابق مع المدقق
+    net_total = line_ext_total
 
-    # مرجع الإشعار الدائن لو موجود
-    cn_ref = _credit_note_reference(doc)
+    # AllowanceCharge على مستوى المستند: فقط لغير الضريبي
+    allowance_total = 0.0 if is_taxed else max(document_discount, 0.0)
 
-    # بناء XML
-    # ملاحظة: نستخدم namespaces كما بالدليل؛ JoFotara يتسامح مع ترتيب الوسوم طالما UBL صحيح.
-    xml = []
-    A = xml.append
+    taxable_base = max(net_total - allowance_total, 0.0)
 
-    A(f'<?xml version="1.0" encoding="UTF-8"?>')
-    A(f'<Invoice xmlns="{NSMAP["inv"]}" '
-      f'xmlns:cac="{NSMAP["cac"]}" '
-      f'xmlns:cbc="{NSMAP["cbc"]}">')
+    tax_total = 0.0
+    if is_taxed:
+        tax_total = taxable_base * (tax_rate / 100.0)
 
-    # --- A. Basic information ---
-    A(f'  <cbc:ID>{inv_id}</cbc:ID>')
-    A(f'  <cbc:UUID>{uuid_val}</cbc:UUID>')
-    A(f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>')
-    A(f'  <cbc:InvoiceTypeCode name="{name_attr}">{invoice_type_code}</cbc:InvoiceTypeCode>')
+    inclusive_total = taxable_base + tax_total
 
-    if note:
-        A(f'  <cbc:Note>{frappe.safe_encode(note).decode("utf-8")}</cbc:Note>')
+    grand_total = float(getattr(doc, "grand_total", 0) or inclusive_total)
+    rounded_total = float(getattr(doc, "rounded_total", 0) or grand_total)
+    rounding_adj = float(getattr(doc, "rounding_adjustment", 0) or (rounded_total - grand_total))
 
-    A(f'  <cbc:DocumentCurrencyCode>{CURRENCY}</cbc:DocumentCurrencyCode>')
-    A(f'  <cbc:TaxCurrencyCode>{TAX_CURRENCY}</cbc:TaxCurrencyCode>')
+    lines_xml = "\n".join(line_blocks)
 
-    # ICV
-    A('  <cac:AdditionalDocumentReference>')
-    A('    <cbc:ID>ICV</cbc:ID>')
-    A(f'    <cbc:UUID>{icv}</cbc:UUID>')
-    A('  </cac:AdditionalDocumentReference>')
+    # ===== XML =====
+    parts = []
+    parts += [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"',
+        '         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"',
+        '         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">',
+        '  <cbc:ProfileID>reporting:1.0</cbc:ProfileID>',
+        f'  <cbc:ID>{invoice_id}</cbc:ID>',
+        f'  <cbc:UUID>{uuid}</cbc:UUID>',
+        f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>',
+        f'  <cbc:InvoiceTypeCode name="{inv_type_name}">{inv_code}</cbc:InvoiceTypeCode>',
+        f'  <cbc:Note>{frappe.utils.escape_html(note)}</cbc:Note>',
+        f'  <cbc:DocumentCurrencyCode>{cur}</cbc:DocumentCurrencyCode>',
+        f'  <cbc:TaxCurrencyCode>{cur}</cbc:TaxCurrencyCode>',
 
-    # --- B. Seller (Supplier) ---
-    A('  <cac:AccountingSupplierParty>')
-    A('    <cac:Party>')
-    if seller_tax:
-        A('      <cac:PartyTaxScheme>')
-        A(f'        <cbc:CompanyID>{seller_tax}</cbc:CompanyID>')
-        A('      </cac:PartyTaxScheme>')
-    A('      <cac:PartyLegalEntity>')
-    A(f'        <cbc:RegistrationName>{seller_name}</cbc:RegistrationName>')
-    A('      </cac:PartyLegalEntity>')
-    A('    </cac:Party>')
-    A('  </cac:AccountingSupplierParty>')
+        # ICV
+        "  <cac:AdditionalDocumentReference>",
+        "    <cbc:ID>ICV</cbc:ID>",
+        f"    <cbc:UUID>{icv}</cbc:UUID>",
+        "  </cac:AdditionalDocumentReference>",
 
-    # --- C. Customer (Buyer) ---
-    A('  <cac:AccountingCustomerParty>')
-    A('    <cac:Party>')
-    if cust.get("id") and cust.get("scheme"):
-        A('      <cac:PartyIdentification>')
-        A(f'        <cbc:ID schemeID="{cust["scheme"]}">{cust["id"]}</cbc:ID>')
-        A('      </cac:PartyIdentification>')
-    A('      <cac:PartyLegalEntity>')
-    A(f'        <cbc:RegistrationName>{cust["name"]}</cbc:RegistrationName>')
-    A('      </cac:PartyLegalEntity>')
-    A('    </cac:Party>')
-    A('  </cac:AccountingCustomerParty>')
+        "",
+        # ✅ ActivityNumber في المكان المعتمد داخل هوية المورد
+        "  <cac:SellerSupplierParty>",
+        "    <cac:Party>",
+        "      <cac:PartyIdentification>",
+        f"        <cbc:ID>{frappe.utils.escape_html(activity_number)}</cbc:ID>",
+        "      </cac:PartyIdentification>",
+        "    </cac:Party>",
+        "  </cac:SellerSupplierParty>",
+        "",
+        # Seller
+        "  <cac:AccountingSupplierParty>",
+        "    <cac:Party>",
+        "      <cac:PostalAddress>",
+        "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
+        "      </cac:PostalAddress>",
+        "      <cac:PartyTaxScheme>",
+        f"        <cbc:CompanyID>{frappe.utils.escape_html(supplier_tax)}</cbc:CompanyID>",
+        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
+        "      </cac:PartyTaxScheme>",
+        "      <cac:PartyLegalEntity>",
+        f"        <cbc:RegistrationName>{frappe.utils.escape_html(supplier_name)}</cbc:RegistrationName>",
+        "      </cac:PartyLegalEntity>",
+        "    </cac:Party>",
+        "  </cac:AccountingSupplierParty>",
+        "",
+        # Buyer
+        "  <cac:AccountingCustomerParty>",
+        "    <cac:Party>",
+    ]
+    if buyer_id:
+        parts += [
+            "      <cac:PartyIdentification>",
+            f'        <cbc:ID schemeID="{buyer_scheme}">{frappe.utils.escape_html(buyer_id)}</cbc:ID>',
+            "      </cac:PartyIdentification>",
+        ]
+    parts += [
+        "      <cac:PostalAddress>",
+        f"        <cbc:PostalZone>{frappe.utils.escape_html(postal_code)}</cbc:PostalZone>",
+        "        <cac:Country><cbc:IdentificationCode>JO</cbc:IdentificationCode></cac:Country>",
+        "      </cac:PostalAddress>",
+        "      <cac:PartyTaxScheme>",
+        "        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>",
+        "      </cac:PartyTaxScheme>",
+        "      <cac:PartyLegalEntity>",
+        f"        <cbc:RegistrationName>{frappe.utils.escape_html(customer_name)}</cbc:RegistrationName>",
+        "      </cac:PartyLegalEntity>",
+        "    </cac:Party>",
+        "    <cac:AccountingContact>",
+        f"      <cbc:Telephone>{frappe.utils.escape_html(buyer_phone)}</cbc:Telephone>",
+        "    </cac:AccountingContact>",
+        "  </cac:AccountingCustomerParty>",
+        ""
+    ]
 
-    # --- D. Activity Number ---
-    if activity_no:
-        A('  <cac:SellerSupplierParty>')
-        A('    <cac:Party>')
-        A('      <cac:PartyIdentification>')
-        A(f'        <cbc:ID>{activity_no}</cbc:ID>')
-        A('      </cac:PartyIdentification>')
-        A('    </cac:Party>')
-        A('  </cac:SellerSupplierParty>')
+    # AllowanceCharge document-level فقط لغير الضريبي
+    if allowance_total and allowance_total != 0 and not is_taxed:
+        parts += [
+            "  <cac:AllowanceCharge>",
+            "    <cbc:ChargeIndicator>false</cbc:ChargeIndicator>",
+            "    <cbc:AllowanceChargeReason>discount</cbc:AllowanceChargeReason>",
+            f'    <cbc:Amount currencyID="{cur}">{_fmt(allowance_total, 3)}</cbc:Amount>',
+            "  </cac:AllowanceCharge>",
+            ""
+        ]
 
-    # --- Credit Note Reference (إن وجِد) ---
-    if invoice_type_code == CREDIT_NOTE and cn_ref:
-        A('  <cac:BillingReference>')
-        A('    <cac:InvoiceDocumentReference>')
-        A(f'      <cbc:ID>{cn_ref}</cbc:ID>')
-        A('    </cac:InvoiceDocumentReference>')
-        A('  </cac:BillingReference>')
+    # TaxTotal — إجمالي الضريبة العامة
+    if is_taxed:
+        parts += [
+            "  <cac:TaxTotal>",
+            f'    <cbc:TaxAmount currencyID="{cur}">{_fmt(tax_total, 3)}</cbc:TaxAmount>',
+            "  </cac:TaxTotal>",
+            ""
+        ]
 
-    # --- E. Tax Total (مجمّع) ---
-    if totals["tax"] > 0:
-        A('  <cac:TaxTotal>')
-        A(f'    <cbc:TaxAmount currencyID="{CURRENCY}">{_fmt(totals["tax"], 3)}</cbc:TaxAmount>')
-        A('    <cac:TaxSubtotal>')
-        A(f'      <cbc:TaxableAmount currencyID="{CURRENCY}">{_fmt(totals["net"], 3)}</cbc:TaxableAmount>')
-        A(f'      <cbc:TaxAmount currencyID="{CURRENCY}">{_fmt(totals["tax"], 3)}</cbc:TaxAmount>')
-        A('      <cac:TaxCategory>')
-        A(f'        <cbc:ID>{tax_category}</cbc:ID>')
-        A(f'        <cbc:Percent>{_fmt(tax_rate, 3)}</cbc:Percent>')
-        A('      </cac:TaxCategory>')
-        A('    </cac:TaxSubtotal>')
-        A('  </cac:TaxTotal>')
+    # LegalMonetaryTotal
+    parts += [
+        "  <cac:LegalMonetaryTotal>",
+        f'    <cbc:LineExtensionAmount currencyID="{cur}">{_fmt(net_total, 3)}</cbc:LineExtensionAmount>',
+        f'    <cbc:TaxExclusiveAmount currencyID="{cur}">{_fmt(taxable_base, 3)}</cbc:TaxExclusiveAmount>',
+        f'    <cbc:TaxInclusiveAmount currencyID="{cur}">{_fmt(inclusive_total, 3)}</cbc:TaxInclusiveAmount>',
+        f'    <cbc:AllowanceTotalAmount currencyID="{cur}">{_fmt(0.0 if is_taxed else allowance_total, 3)}</cbc:AllowanceTotalAmount>',
+    ]
+    if rounding_adj:
+        parts += [f'    <cbc:PayableRoundingAmount currencyID="{cur}">{_fmt(rounding_adj, 3)}</cbc:PayableRoundingAmount>']
+    parts += [
+        f'    <cbc:PayableAmount currencyID="{cur}">{_fmt(inclusive_total + rounding_adj, 3)}</cbc:PayableAmount>',
+        "  </cac:LegalMonetaryTotal>",
+        "",
+        lines_xml,
+        "</Invoice>",
+    ]
 
-    # --- F. Monetary Totals ---
-    A('  <cac:LegalMonetaryTotal>')
-    A(f'    <cbc:LineExtensionAmount currencyID="{CURRENCY}">{_fmt(totals["net"], 3)}</cbc:LineExtensionAmount>')
-    A(f'    <cbc:TaxExclusiveAmount currencyID="{CURRENCY}">{_fmt(totals["net"], 3)}</cbc:TaxExclusiveAmount>')
-    A(f'    <cbc:TaxInclusiveAmount currencyID="{CURRENCY}">{_fmt(totals["grand"], 3)}</cbc:TaxInclusiveAmount>')
-    A(f'    <cbc:PayableAmount currencyID="{CURRENCY}">{_fmt(totals["grand"], 3)}</cbc:PayableAmount>')
-    A('  </cac:LegalMonetaryTotal>')
+    return "\n".join(parts)
 
-    # --- G. Lines ---
-    for l in lines:
-        A('  <cac:InvoiceLine>')
-        A(f'    <cbc:ID>{l["idx"]}</cbc:ID>')
-        A(f'    <cbc:InvoicedQuantity unitCode="{l["uom"]}">{_fmt(l["qty"], 3)}</cbc:InvoicedQuantity>')
-        A(f'    <cbc:LineExtensionAmount currencyID="{CURRENCY}">{_fmt(l["line_net"], 3)}</cbc:LineExtensionAmount>')
-
-        # الضريبة على مستوى السطر (مطلوبة لإيضاح التصنيف)
-        if l["tax_rate"] >= 0:
-            A('    <cac:TaxTotal>')
-            A(f'      <cbc:TaxAmount currencyID="{CURRENCY}">{_fmt(l["tax_amount"], 3)}</cbc:TaxAmount>')
-            A('      <cac:TaxSubtotal>')
-            A(f'        <cbc:TaxableAmount currencyID="{CURRENCY}">{_fmt(l["line_net"], 3)}</cbc:TaxableAmount>')
-            A(f'        <cbc:TaxAmount currencyID="{CURRENCY}">{_fmt(l["tax_amount"], 3)}</cbc:TaxAmount>')
-            A('        <cac:TaxCategory>')
-            A(f'          <cbc:ID>{l["tax_category"]}</cbc:ID>')
-            A(f'          <cbc:Percent>{_fmt(l["tax_rate"], 3)}</cbc:Percent>')
-            A('        </cac:TaxCategory>')
-            A('      </cac:TaxSubtotal>')
-            A('    </cac:TaxTotal>')
-
-        # تفاصيل السلعة
-        A('    <cac:Item>')
-        A(f'      <cbc:Name>{l["name"]}</cbc:Name>')
-        A('    </cac:Item>')
-
-        # السعر
-        A('    <cac:Price>')
-        A(f'      <cbc:PriceAmount currencyID="{CURRENCY}">{_fmt(l["rate"], 3)}</cbc:PriceAmount>')
-        A('    </cac:Price>')
-
-        A('  </cac:InvoiceLine>')
-
-    A('</Invoice>')
-
-    return "\n".join(xml)
