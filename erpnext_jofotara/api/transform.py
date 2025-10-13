@@ -1,4 +1,4 @@
-# erpnext_jofotara/api/transform.p
+# erpnext_jofotara/api/transform.py
 from __future__ import annotations
 
 import re
@@ -11,6 +11,7 @@ __all__ = ["build_invoice_xml"]
 
 INVOICE = "388"      # New invoice
 CREDIT_NOTE = "381"  # Credit note
+
 
 def _fmt(n: float | Decimal, places: int = 3) -> str:
     try:
