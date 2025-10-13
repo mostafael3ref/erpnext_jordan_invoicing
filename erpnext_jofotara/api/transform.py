@@ -112,11 +112,9 @@ def _invoice_name_attr(doc) -> str:
 def _seller_info(doc) -> Tuple[str, str, str]:
     """Return (registration_name, tax_number, activity_number)."""
     s = _get_settings()
-
     reg_name = (getattr(doc, "company", None) or "Seller").strip()
     tax_no = (getattr(s, "seller_tax_number", None) or getattr(doc, "tax_id", None) or "").strip()
     activity = (getattr(s, "activity_number", None) or "").strip()
-
     return reg_name, tax_no, activity
 
 def _customer_info(doc) -> Dict[str, str]:
@@ -124,16 +122,13 @@ def _customer_info(doc) -> Dict[str, str]:
     name = (getattr(doc, "customer_name", None) or getattr(doc, "customer", None) or "عميل نقدي").strip()
     scheme = ""
     cid = ""
-
     for fn in ("customer_tax_id", "tax_id", "buyer_tax_no", "national_id", "vat_tin"):
         val = getattr(doc, fn, None)
         if val:
             cid = str(val).strip()
             break
-
     if cid:
         scheme = "TN"  # treat as tax number by default
-
     return {"name": name, "id": cid, "scheme": scheme}
 
 def _tax_category_and_rate(doc) -> Tuple[str, Decimal]:
@@ -153,19 +148,15 @@ def _lines(doc) -> List[Dict[str, Any]]:
     """Build line dicts with discount & tax per-line."""
     rows: List[Dict[str, Any]] = []
     category, rate = _tax_category_and_rate(doc)
-
     for i, d in enumerate(getattr(doc, "items", []) or [], start=1):
         qty = _dec(getattr(d, "qty", 0))
         unit_rate = _dec(getattr(d, "rate", 0))
         discount = _dec(getattr(d, "discount_amount", 0))
-
         base_amount = qty * unit_rate
         line_net = base_amount - discount
         if line_net < 0:
             line_net = Decimal("0")
-
         tax_amt = (line_net * rate / Decimal("100")) if rate > 0 else Decimal("0")
-
         rows.append({
             "idx": i,
             "name": getattr(d, "item_name", None) or getattr(d, "item_code", None) or f"Item {i}",
@@ -243,7 +234,6 @@ def build_invoice_xml(name: str) -> str:
     A(f'  <cbc:IssueDate>{issue_date}</cbc:IssueDate>')
     A(f'  <cbc:InvoiceTypeCode name="{name_attr}">{inv_type_code}</cbc:InvoiceTypeCode>')
     if note:
-        # safe_encode -> bytes -> decode preserves Arabic
         A(f'  <cbc:Note>{frappe.safe_encode(note).decode("utf-8")}</cbc:Note>')
     A(f'  <cbc:DocumentCurrencyCode>{CURRENCY}</cbc:DocumentCurrencyCode>')
     A(f'  <cbc:TaxCurrencyCode>{TAX_CURRENCY}</cbc:TaxCurrencyCode>')
@@ -254,9 +244,13 @@ def build_invoice_xml(name: str) -> str:
     A(f'    <cbc:UUID>{icv}</cbc:UUID>')
     A('  </cac:AdditionalDocumentReference>')
 
-    # B. Seller
+    # B. Seller (AccountingSupplierParty)  ✅ ضع ActivityNumber هنا
     A('  <cac:AccountingSupplierParty>')
     A('    <cac:Party>')
+    if activity_no:
+        A('      <cac:PartyIdentification>')
+        A(f'        <cbc:ID schemeID="ActivityNumber">{activity_no}</cbc:ID>')
+        A('      </cac:PartyIdentification>')
     if seller_tax:
         A('      <cac:PartyTaxScheme>')
         A(f'        <cbc:CompanyID>{seller_tax}</cbc:CompanyID>')
@@ -279,16 +273,6 @@ def build_invoice_xml(name: str) -> str:
     A('      </cac:PartyLegalEntity>')
     A('    </cac:Party>')
     A('  </cac:AccountingCustomerParty>')
-
-    # D. Activity Number (seller)
-    if activity_no:
-        A('  <cac:SellerSupplierParty>')
-        A('    <cac:Party>')
-        A('      <cac:PartyIdentification>')
-        A(f'        <cbc:ID>{activity_no}</cbc:ID>')
-        A('      </cac:PartyIdentification>')
-        A('    </cac:Party>')
-        A('  </cac:SellerSupplierParty>')
 
     # Credit note reference
     if inv_type_code == CREDIT_NOTE and (orig_id or orig_uuid):
@@ -328,7 +312,7 @@ def build_invoice_xml(name: str) -> str:
         A('  <cac:InvoiceLine>')
         A(f'    <cbc:ID>{l["idx"]}</cbc:ID>')
         A(f'    <cbc:InvoicedQuantity unitCode="{l["uom"]}">{_fmt(l["qty"], 3)}</cbc:InvoicedQuantity>')
-        A(f'    <cbc:LineExtensionAmount currencyID="{CURRENCY}">{_fmt(l["line_net"], 3)}</cbc:LineExtensionAmount>')
+        A(f'    <cbc:LineExtensionAmount currencyID="{CURRENCY}">{_fmt(l{"line_net"], 3)}</cbc:LineExtensionAmount>')
 
         # AllowanceCharge (discount at line level)
         if l["discount"] > 0:
@@ -364,5 +348,4 @@ def build_invoice_xml(name: str) -> str:
         A('  </cac:InvoiceLine>')
 
     A('</Invoice>')
-
     return "\n".join(xml)
