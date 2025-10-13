@@ -104,6 +104,15 @@ def _tax_rate_from_doc(doc) -> float:
     return rate
 
 
+def _get_activity_number() -> str:
+    s = frappe.get_single("JoFotara Settings")
+    raw = (getattr(s, "activity_number", "") or "").strip()
+    activity = re.sub(r"\D", "", raw)
+    if not (1 <= len(activity) <= 15):
+        frappe.throw("JoFotara Settings: Activity Number is required and must be 1–15 digits (numbers only).")
+    return activity
+
+
 def build_invoice_xml(si_name: str) -> str:
     doc = frappe.get_doc("Sales Invoice", si_name)
 
@@ -124,9 +133,7 @@ def build_invoice_xml(si_name: str) -> str:
     supplier_name, supplier_tax = _seller_info(doc)
     customer_name, buyer_phone, postal_code, buyer_id, buyer_scheme = _buyer_info(doc)
 
-    # ActivityNumber من الإعدادات — أرقام فقط
-    s = frappe.get_single("JoFotara Settings")
-    _activity = re.sub(r"\D", "", (getattr(s, "activity_number", "") or "").strip())
+    activity_number = _get_activity_number()
 
     # ===== Lines: حضّر بيانات البنود أولاً لنوزّع خصم المستند (إن وجد) =====
     raw_lines: List[Dict] = []
@@ -151,7 +158,7 @@ def build_invoice_xml(si_name: str) -> str:
         })
         sum_after_item_disc += base_after_item_disc
 
-    # خصم المستند — إن كان ضريبيًا نوزعه على البنود (بدون إرسال AllowanceCharge على مستوى المستند)
+    # خصم المستند — إن كان ضريبيًا نوزعه على البنود (ولا نرسل AllowanceCharge على مستوى المستند)
     document_discount = float(getattr(doc, "discount_amount", 0) or 0.0)
     distribute_doc_disc = is_taxed and document_discount > 0.0
 
@@ -215,15 +222,17 @@ def build_invoice_xml(si_name: str) -> str:
         ]))
 
     # ===== Totals =====
-    # net_total من ERPNext يكون بعد خصم المستند؛ نتأكد أن مجموع السطور مطابق
-    net_total = float(getattr(doc, "net_total", 0) or line_ext_total)
+    # نخلي الحسابات من السطور لضمان التطابق مع المدقق
+    net_total = line_ext_total
+
     # AllowanceCharge على مستوى المستند: فقط لغير الضريبي
     allowance_total = 0.0 if is_taxed else max(document_discount, 0.0)
+
     taxable_base = max(net_total - allowance_total, 0.0)
 
     tax_total = 0.0
     if is_taxed:
-        tax_total = float(getattr(doc, "total_taxes_and_charges", 0) or (taxable_base * tax_rate / 100.0))
+        tax_total = taxable_base * (tax_rate / 100.0)
 
     inclusive_total = taxable_base + tax_total
 
@@ -255,11 +264,15 @@ def build_invoice_xml(si_name: str) -> str:
         f"    <cbc:UUID>{icv}</cbc:UUID>",
         "  </cac:AdditionalDocumentReference>",
 
-        # ActivityNumber (مكانه الصحيح كمرجع إضافي)
-        "  <cac:AdditionalDocumentReference>",
-        "    <cbc:ID>ActivityNumber</cbc:ID>",
-        f"    <cbc:UUID>{frappe.utils.escape_html(_activity)}</cbc:UUID>",
-        "  </cac:AdditionalDocumentReference>",
+        "",
+        # ✅ ActivityNumber في المكان المعتمد داخل هوية المورد
+        "  <cac:SellerSupplierParty>",
+        "    <cac:Party>",
+        "      <cac:PartyIdentification>",
+        f"        <cbc:ID>{frappe.utils.escape_html(activity_number)}</cbc:ID>",
+        "      </cac:PartyIdentification>",
+        "    </cac:Party>",
+        "  </cac:SellerSupplierParty>",
         "",
         # Seller
         "  <cac:AccountingSupplierParty>",
