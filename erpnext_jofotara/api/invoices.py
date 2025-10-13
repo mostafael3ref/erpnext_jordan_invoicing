@@ -100,6 +100,38 @@ def _apply_response_to_invoice(doc, resp: Dict[str, Any]) -> None:
 # Public API
 # =========================
 
+# --- أضِف الهيلبر ده أعلى الملف (مع باقي الutilities) ---
+def _save_xml_snapshot(doc, xml_str: str):
+    """احفظ نسخة من UBL XML على الفاتورة كـ Attachment
+       ولو فيه حقل jofotara_xml اكتبه برضه. وكمان خزّن معاينة في Settings."""
+    try:
+        # لو في حقل نصي اسمه jofotara_xml اكتبه
+        if doc.meta.has_field("jofotara_xml"):
+            doc.db_set("jofotara_xml", xml_str)
+
+        # احفظه كملف مرفق على الفاتورة
+        frappe.get_doc({
+            "doctype": "File",
+            "file_name": f"{doc.name}-ubl.xml",
+            "content": xml_str,
+            "is_private": 1,
+            "attached_to_doctype": "Sales Invoice",
+            "attached_to_name": doc.name,
+        }).insert(ignore_permissions=True)
+
+        # اختياري: خزن نسخة مختصرة في الإعدادات لتسهيل الدِبَج من الديسكتوب
+        try:
+            s = _get_settings()
+            if s.meta.has_field("last_xml"):
+                s.db_set("last_xml", xml_str[:100000])  # لو أضفت الحقل ده في DocType
+        except Exception:
+            pass
+
+    except Exception:
+        # ما نكسر العملية بسبب التخزين؛ سجّل فقط
+        frappe.log_error(frappe.get_traceback(), "JoFotara - save XML snapshot")
+
+
 @frappe.whitelist()
 def send_now(name: str) -> Dict[str, Any]:
     """
@@ -120,7 +152,12 @@ def send_now(name: str) -> Dict[str, Any]:
 
     # 3) تحسين بسيط ثم Base64
     xml_min = _minify_xml(xml)
+
+    # ✅ احفظ نسخة من الـ XML على الفاتورة كمرفق + في حقل jofotara_xml لو موجود
+    _save_xml_snapshot(doc, xml_min)
+
     b64 = to_b64(xml_min)
+
 
     # 4) الإرسال عبر عميل HTTP (يراعي الإعدادات والرؤوس حسب الدليل)
     try:
