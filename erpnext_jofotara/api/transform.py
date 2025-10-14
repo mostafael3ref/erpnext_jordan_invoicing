@@ -16,9 +16,8 @@ NS_INVOICE = 'urn:oasis:names:specification:ubl:schema:xsd:Invoice-2'
 NS_CAC     = 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2'
 NS_CBC     = 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2'
 
-Q3 = Decimal("0.001")  # 3 decimals
+Q3 = Decimal("0.001")
 
-# ---------------- Helpers ----------------
 def _get_settings(): return frappe.get_single("JoFotara Settings")
 
 def _q3(x) -> Decimal:
@@ -74,9 +73,9 @@ def _get_customer_info(doc) -> Tuple[str,str]:
 def _payment_method_code(doc) -> str:
     try:
         if float(getattr(doc,"outstanding_amount",0) or 0) <= 0.0001 or int(getattr(doc,"is_pos",0) or 0):
-            return "011"  # Cash
+            return "011"
     except Exception: pass
-    return "021"        # Credit
+    return "021"
 
 def _is_credit(doc) -> bool:
     if int(getattr(doc,"is_return",0) or 0) == 1: return True
@@ -87,7 +86,6 @@ def _is_credit(doc) -> bool:
     return False
 
 def _parse_item_tax_rates(item) -> Dict[str, float]:
-    """ يرجّع {"vat ...": %, "special ...": %, ...} حسب أسماء الضرائب في item_tax_rate """
     out: Dict[str, float] = {}
     try:
         txt = getattr(item, "item_tax_rate", "") or ""
@@ -104,7 +102,6 @@ def _invoice_uuid(doc) -> str:
     if existing: return existing
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{doc.doctype}:{doc.name}"))
 
-# -------------- Builder --------------
 def build_invoice_xml(name: str) -> str:
     doc = frappe.get_doc("Sales Invoice", name)
     s = _get_settings()
@@ -133,7 +130,6 @@ def build_invoice_xml(name: str) -> str:
     inv_disc = Decimal(str(getattr(doc,"discount_amount",0) or 0))
     disc_left = inv_disc
 
-    # نسبة ضريبية افتراضية لو مفيش per-line
     doc_total_tax = Decimal(str(getattr(doc,"total_taxes_and_charges",0) or 0))
     default_ratio = (doc_total_tax / sum_net_base) if (sum_net_base > 0 and doc_total_tax > 0) else Decimal("0.0")
 
@@ -141,6 +137,8 @@ def build_invoice_xml(name: str) -> str:
     total_vat = Decimal("0.0")
     total_special = Decimal("0.0")
     total_excl = Decimal("0.0")
+    taxable_vat_sum = Decimal("0.0")
+    taxable_special_sum = Decimal("0.0")
 
     for idx, it in enumerate(items, start=1):
         qty = _q3(getattr(it,"qty",0))
@@ -178,6 +176,8 @@ def build_invoice_xml(name: str) -> str:
         total_excl    += line_excl
         total_vat     += line_vat
         total_special += line_special
+        if vat_rate > 0: taxable_vat_sum += line_excl
+        if spl_rate > 0: taxable_special_sum += line_excl
 
         uom = _uom_code(getattr(it,"uom",None))
         iname = (getattr(it,"item_name","") or getattr(it,"item_code","") or getattr(it,"description","") or "Item")
@@ -191,29 +191,29 @@ def build_invoice_xml(name: str) -> str:
             "line_excl": line_excl,
             "line_vat": line_vat,
             "line_special": line_special,
+            "vat_percent": vat_rate,          # <-- نحتاجها لcbc:Percent
+            "special_percent": spl_rate,      # <-- نحتاجها لcbc:Percent
             "price_after_disc": price_after_disc,
             "line_disc_total": _q3(line_disc_field + pro_rata),
         })
 
-    # إجماليات من القيم المقربة
     tax_exclusive = _q3(total_excl)
     tax_total     = _q3(total_vat + total_special)
     tax_inclusive = _q3(tax_exclusive + tax_total)
 
-    # ===== دعم التقريب (Rounded Total) =====
+    # ===== التقريب (Rounded Total) =====
     rounded_total = Decimal(str(getattr(doc, "rounded_total", 0) or 0))
     rounding_adj  = Decimal(str(getattr(doc, "rounding_adjustment", 0) or 0))
     use_rounding  = (rounded_total != 0) or (rounding_adj != 0)
 
     if use_rounding:
-        # PayableRoundingAmount = rounded_total - tax_inclusive  (قد تكون سالبة)
         payable_rounding = _q3(rounded_total - tax_inclusive)
         payable_amount   = _q3(rounded_total)
     else:
         payable_rounding = Decimal("0.000")
         payable_amount   = _q3(tax_inclusive)
 
-    # ========== كتابة XML ==========
+    # ========== XML ==========
     A: List[str] = []
     def add(x: str): A.append(x)
 
@@ -249,7 +249,7 @@ def build_invoice_xml(name: str) -> str:
     add('    </cac:Party>')
     add('  </cac:AccountingSupplierParty>')
 
-    # Customer (قبل SellerSupplierParty)
+    # Customer
     add('  <cac:AccountingCustomerParty>')
     add('    <cac:Party>')
     if customer_tax:
@@ -271,21 +271,29 @@ def build_invoice_xml(name: str) -> str:
     add('    </cac:Party>')
     add('  </cac:SellerSupplierParty>')
 
-    # TaxTotal (overall) — VAT فقط لو Special=0
+    # TaxTotal (overall) — الآن مع TaxableAmount و Percent
     add('  <cac:TaxTotal>')
     add(f'    <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(tax_total)}</cbc:TaxAmount>')
-    # VAT Subtotal
-    add('    <cac:TaxSubtotal>')
-    add(f'      <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(total_vat)}</cbc:TaxAmount>')
-    add('      <cac:TaxCategory>')
-    add('        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>')
-    add('      </cac:TaxCategory>')
-    add('    </cac:TaxSubtotal>')
-    # Special Subtotal فقط إذا > 0
+    if total_vat > 0:
+        add('    <cac:TaxSubtotal>')
+        add(f'      <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(taxable_vat_sum)}</cbc:TaxableAmount>')
+        add(f'      <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(total_vat)}</cbc:TaxAmount>')
+        add('      <cac:TaxCategory>')
+        add('        <cbc:ID>S</cbc:ID>')
+        # استخدم نسبة تقريبية من الفاتورة (لو كل السطور 16% هتطلع 16.000)
+        percent_vat = ( (total_vat / taxable_vat_sum * 100) if taxable_vat_sum > 0 else Decimal("0") )
+        add(f'        <cbc:Percent>{_fmt(percent_vat)}</cbc:Percent>')
+        add('        <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>')
+        add('      </cac:TaxCategory>')
+        add('    </cac:TaxSubtotal>')
     if total_special > 0:
         add('    <cac:TaxSubtotal>')
-        add(f'      <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(total_special)}</cbc:TaxAmount>')
+        add(f'      <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(taxable_special_sum)}</cbc:TaxableAmount>')
+        add(f'      <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(total_special)}</cbc:TaxAmount>')
         add('      <cac:TaxCategory>')
+        add('        <cbc:ID>S</cbc:ID>')
+        percent_sp = ( (total_special / taxable_special_sum * 100) if taxable_special_sum > 0 else Decimal("0") )
+        add(f'        <cbc:Percent>{_fmt(percent_sp)}</cbc:Percent>')
         add('        <cac:TaxScheme><cbc:ID>Special</cbc:ID></cac:TaxScheme>')
         add('      </cac:TaxCategory>')
         add('    </cac:TaxSubtotal>')
@@ -295,12 +303,13 @@ def build_invoice_xml(name: str) -> str:
     add('  <cac:LegalMonetaryTotal>')
     add(f'    <cbc:TaxExclusiveAmount currencyID="{_escape(currency)}">{_fmt(tax_exclusive)}</cbc:TaxExclusiveAmount>')
     add(f'    <cbc:TaxInclusiveAmount currencyID="{_escape(currency)}">{_fmt(tax_inclusive)}</cbc:TaxInclusiveAmount>')
-    if use_rounding and payable_rounding != 0:
+    # Rounding (لو موجود)
+    if payable_rounding != 0:
         add(f'    <cbc:PayableRoundingAmount currencyID="{_escape(currency)}">{_fmt(payable_rounding)}</cbc:PayableRoundingAmount>')
     add(f'    <cbc:PayableAmount currencyID="{_escape(currency)}">{_fmt(payable_amount)}</cbc:PayableAmount>')
     add('  </cac:LegalMonetaryTotal>')
 
-    # InvoiceLine(s)
+    # InvoiceLine(s) — مع Percent و ID في TaxCategory
     for L in prepped:
         add('  <cac:InvoiceLine>')
         add(f'    <cbc:ID>{L["idx"]}</cbc:ID>')
@@ -309,19 +318,23 @@ def build_invoice_xml(name: str) -> str:
         add('    <cac:TaxTotal>')
         line_tax_total = _q3(L["line_vat"] + L["line_special"])
         add(f'      <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(line_tax_total)}</cbc:TaxAmount>')
-        # VAT
         if L["line_vat"] > 0:
             add('      <cac:TaxSubtotal>')
-            add(f'        <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(L["line_vat"])}</cbc:TaxAmount>')
+            add(f'        <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(L["line_excl"])}</cbc:TaxableAmount>')
+            add(f'        <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(L["line_vat"])}</cbc:TaxAmount>')
             add('        <cac:TaxCategory>')
+            add('          <cbc:ID>S</cbc:ID>')
+            add(f'          <cbc:Percent>{_fmt(L["vat_percent"])}</cbc:Percent>')
             add('          <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>')
             add('        </cac:TaxCategory>')
             add('      </cac:TaxSubtotal>')
-        # Special فقط إذا > 0
         if L["line_special"] > 0:
             add('      <cac:TaxSubtotal>')
-            add(f'        <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(L["line_special"])}</cbc:TaxAmount>')
+            add(f'        <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(L["line_excl"])}</cbc:TaxableAmount>')
+            add(f'        <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(L["line_special"])}</cbc:TaxAmount>')
             add('        <cac:TaxCategory>')
+            add('          <cbc:ID>S</cbc:ID>')
+            add(f'          <cbc:Percent>{_fmt(L["special_percent"])}</cbc:Percent>')
             add('          <cac:TaxScheme><cbc:ID>Special</cbc:ID></cac:TaxScheme>')
             add('        </cac:TaxCategory>')
             add('      </cac:TaxSubtotal>')
