@@ -19,7 +19,7 @@ NS_CBC     = 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents
 Q3 = Decimal("0.001")  # 3 decimals
 
 # ---------------- Helpers ----------------
-def _get_settings(): 
+def _get_settings():
     return frappe.get_single("JoFotara Settings")
 
 def _q3(x) -> Decimal:
@@ -29,7 +29,7 @@ def _fmt(x, places: int = 3) -> str:
     return f"{_q3(x):.{places}f}"
 
 def _escape(s: str | None) -> str:
-    if not s: 
+    if not s:
         return ""
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
              .replace('"',"&quot;").replace("'","&apos;"))
@@ -70,7 +70,7 @@ def _get_customer_info(doc) -> Tuple[str,str]:
             cust = frappe.get_doc("Customer", doc.customer)
             if not cname: cname = (getattr(cust,"customer_name","") or cust.name or "").strip()
             if not tax:  tax  = (getattr(cust,"tax_id","") or getattr(cust,"national_id","") or "").strip()
-        except Exception: 
+        except Exception:
             pass
     return (cname or "Consumer"), (tax or "")
 
@@ -78,20 +78,16 @@ def _payment_method_code(doc) -> str:
     try:
         if float(getattr(doc,"outstanding_amount",0) or 0) <= 0.0001 or int(getattr(doc,"is_pos",0) or 0):
             return "011"  # Cash
-    except Exception: 
+    except Exception:
         pass
     return "021"        # Credit
 
 def _is_credit(doc) -> bool:
-    if int(getattr(doc,"is_return",0) or 0) == 1: 
-        return True
-    if getattr(doc,"return_against",None): 
-        return True
+    if int(getattr(doc,"is_return",0) or 0) == 1: return True
+    if getattr(doc,"return_against",None): return True
     try:
-        if float(doc.base_grand_total or 0) < 0: 
-            return True
-    except Exception: 
-        pass
+        if float(doc.base_grand_total or 0) < 0: return True
+    except Exception: pass
     return False
 
 def _parse_item_tax_rates(item) -> Dict[str, float]:
@@ -109,8 +105,7 @@ def _parse_item_tax_rates(item) -> Dict[str, float]:
 
 def _invoice_uuid(doc) -> str:
     existing = (getattr(doc,"jofotara_uuid","") or "").strip()
-    if existing: 
-        return existing
+    if existing: return existing
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{doc.doctype}:{doc.name}"))
 
 # -------------- Builder --------------
@@ -168,8 +163,7 @@ def build_invoice_xml(name: str) -> str:
                 pro_rata = (disc_left if disc_left > 0 else Decimal("0.0"))
 
         line_excl = base_net_amount - line_disc_field - pro_rata
-        if line_excl < 0: 
-            line_excl = Decimal("0.0")
+        if line_excl < 0: line_excl = Decimal("0.0")
         line_excl = _q3(line_excl)
 
         rates = _parse_item_tax_rates(it)
@@ -242,10 +236,8 @@ def build_invoice_xml(name: str) -> str:
     add(f'  <cbc:TaxCurrencyCode>{_escape(currency)}</cbc:TaxCurrencyCode>')
 
     # ICV اختياري
-    try: 
-        icv = str(getattr(doc,"amended_from","") or getattr(doc,"docstatus",1))
-    except Exception: 
-        icv = "1"
+    try: icv = str(getattr(doc,"amended_from","") or getattr(doc,"docstatus",1))
+    except Exception: icv = "1"
     add('  <cac:AdditionalDocumentReference>')
     add('    <cbc:ID>ICV</cbc:ID>')
     add(f'    <cbc:UUID>{_escape(icv)}</cbc:UUID>')
@@ -287,7 +279,7 @@ def build_invoice_xml(name: str) -> str:
     add('    </cac:Party>')
     add('  </cac:SellerSupplierParty>')
 
-    # --- TaxTotal (overall): نرسل دائمًا VAT + Special (حتى لو Special=0) مع Percent/TaxableAmount ---
+    # --- TaxTotal (overall): أرسل فقط الضرائب الفعلية (Special يُرسل فقط لو > 0) ---
     add('  <cac:TaxTotal>')
     add(f'    <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(tax_total)}</cbc:TaxAmount>')
 
@@ -303,18 +295,18 @@ def build_invoice_xml(name: str) -> str:
     add('      </cac:TaxCategory>')
     add('    </cac:TaxSubtotal>')
 
-    # Special Subtotal (إجباري حتى لو صفر)
-    add('    <cac:TaxSubtotal>')
-    add(f'      <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(taxable_special_sum)}</cbc:TaxableAmount>')
-    add(f'      <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(total_special)}</cbc:TaxAmount>')
-    add('      <cac:TaxCategory>')
-    add('        <cbc:ID>S</cbc:ID>')
-    percent_sp = ((total_special / taxable_special_sum * 100) if taxable_special_sum > 0 else Decimal("0"))
-    add(f'        <cbc:Percent>{_fmt(percent_sp)}</cbc:Percent>')
-    # بعض بيئات JoFotara تفضّل SpecialTax؛ إن واجهت رفض، بدّل إلى "Special"
-    add('        <cac:TaxScheme><cbc:ID>SpecialTax</cbc:ID></cac:TaxScheme>')
-    add('      </cac:TaxCategory>')
-    add('    </cac:TaxSubtotal>')
+    # Special Subtotal فقط لو فعليًا > 0
+    if total_special > 0:
+        add('    <cac:TaxSubtotal>')
+        add(f'      <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(taxable_special_sum)}</cbc:TaxableAmount>')
+        add(f'      <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(total_special)}</cbc:TaxAmount>')
+        add('      <cac:TaxCategory>')
+        add('        <cbc:ID>S</cbc:ID>')
+        percent_sp = ((total_special / taxable_special_sum * 100) if taxable_special_sum > 0 else Decimal("0"))
+        add(f'        <cbc:Percent>{_fmt(percent_sp)}</cbc:Percent>')
+        add('        <cac:TaxScheme><cbc:ID>Special</cbc:ID></cac:TaxScheme>')
+        add('      </cac:TaxCategory>')
+        add('    </cac:TaxSubtotal>')
 
     add('  </cac:TaxTotal>')
 
@@ -353,7 +345,7 @@ def build_invoice_xml(name: str) -> str:
             add('        <cac:TaxCategory>')
             add('          <cbc:ID>S</cbc:ID>')
             add(f'          <cbc:Percent>{_fmt(L["special_percent"])}</cbc:Percent>')
-            add('          <cac:TaxScheme><cbc:ID>SpecialTax</cbc:ID></cac:TaxScheme>')
+            add('          <cac:TaxScheme><cbc:ID>Special</cbc:ID></cac:TaxScheme>')
             add('        </cac:TaxCategory>')
             add('      </cac:TaxSubtotal>')
         add('    </cac:TaxTotal>')
@@ -375,8 +367,8 @@ def build_invoice_xml(name: str) -> str:
     xml = "\n".join(A)
 
     try:
-        if s.meta.has_field("last_xml"): 
+        if s.meta.has_field("last_xml"):
             s.db_set("last_xml", xml[:100000])
-    except Exception: 
+    except Exception:
         pass
     return xml
