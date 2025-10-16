@@ -6,16 +6,17 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Tuple
 from xml.etree.ElementTree import Element, SubElement, tostring
-import xml.etree.ElementTree as ET  # ← استخدم الموديول باسم ET
+import xml.etree.ElementTree as ET
 import json
 import re
+import uuid
 
 import frappe
 from frappe.utils import getdate
 
-# =====================================================
-# ثابتات و Namespaces
-# =====================================================
+# ================================
+# Namespaces & Constants
+# ================================
 
 NS = {
     "inv": "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2",
@@ -23,12 +24,11 @@ NS = {
     "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
     "ext": "urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2",
 }
-# ✅ التصحيح هنا: استخدم ET.register_namespace (مش ElementTree.register_namespace)
 for p, uri in NS.items():
     ET.register_namespace("" if p == "inv" else p, uri)
 
-CURRENCY_CODE_DOC = "JOD"  # في رأس المستند
-CURRENCY_ID_AMT = "JO"     # داخل الحقول النقدية
+CURRENCY_CODE_DOC = "JOD"   # header codes
+CURRENCY_ID_AMT = "JO"      # inside monetary amounts
 FMT3 = Decimal("0.001")
 
 VAT_SCHEME_AGENCY = "6"
@@ -38,9 +38,9 @@ VAT_SCHEME_5153 = "UN/ECE 5153"
 INVOICE = "388"
 CREDIT_NOTE = "381"
 
-# =====================================================
-# Utilities
-# =====================================================
+# ================================
+# Helpers
+# ================================
 
 def _qn(prefix: str, tag: str) -> str:
     return f"{{{NS[prefix]}}}{tag}"
@@ -56,17 +56,24 @@ def _q3(x) -> Decimal:
 def _fmt(x, places: int = 3) -> str:
     return f"{_q3(x):.{places}f}"
 
+def _fmt_qty(x) -> str:
+    # زى Odoo: كمية بعُشر واحد (1.0 / 25.0)
+    return f"{float(x):.1f}"
+
 def _get_settings():
     return frappe.get_single("JoFotara Settings")
 
-def _company_info(company: str) -> Tuple[str, str]:
-    """(company_name, tax_id_fallback)"""
-    name = company
+def _company_info(company: str) -> Tuple[dict, str]:
+    """
+    يرجّع (company_doc_as_dict, tax_id_fallback)
+    هنحتاج PostalZone لو متاحة من العنوان.
+    """
     tax = ""
+    cd = {}
     try:
         c = frappe.get_doc("Company", company)
-        name = (getattr(c, "company_name", None) or c.name or "").strip()
-        # حاول حقول رقم الضريبة الشائعة
+        cd = c.as_dict()
+        # probable tax fields
         for f in ("tax_id", "company_tax_id", "tax_no", "tax_number"):
             if getattr(c, f, None):
                 tax = str(getattr(c, f)).strip()
@@ -79,7 +86,29 @@ def _company_info(company: str) -> Tuple[str, str]:
             tax = (getattr(s, "seller_tax_number", "") or "").strip()
         except Exception:
             tax = ""
-    return name, tax
+    return cd, tax
+
+def _company_postal_zone(company_doc: dict) -> str:
+    """
+    حاول تجيب PostalZone من Company Address إن وُجد.
+    هنقرأ العنوان الافتراضي المرتبط بالشركة لو متاح.
+    """
+    try:
+        addr_link = frappe.get_all(
+            "Dynamic Link",
+            filters={"link_doctype": "Company", "link_name": company_doc.get("name"), "parenttype": "Address"},
+            fields=["parent"], limit=1
+        )
+        if addr_link:
+            addr = frappe.get_doc("Address", addr_link[0]["parent"])
+            # common fields: pincode / zip / postal_code / po_box
+            for f in ("pincode", "zip", "postal_code", "po_box"):
+                v = (getattr(addr, f, None) or "").strip()
+                if v:
+                    return v
+    except Exception:
+        pass
+    return ""  # سيُرسل فاضي لو مش متاح
 
 def _customer_name(doc) -> str:
     nm = (getattr(doc, "customer_name", "") or getattr(doc, "customer", "") or "").strip()
@@ -112,13 +141,11 @@ def _uom_code(u: str | None) -> str:
     return m.get(key, "PCE")
 
 def _parse_item_vat_rate(item) -> Decimal:
-    """إرجاع نسبة VAT للبند من item_tax_rate (لو موجود) وإلا صفر."""
     try:
         txt = getattr(item, "item_tax_rate", "") or ""
         if txt:
             d = json.loads(txt)
-            # التماس: أول قيمة غير صفر
-            for k, v in d.items():
+            for _, v in d.items():
                 rate = _dec(v)
                 if abs(rate) > 0:
                     return rate
@@ -127,7 +154,6 @@ def _parse_item_vat_rate(item) -> Decimal:
     return Decimal("0")
 
 def _global_vat_rate(doc) -> Decimal:
-    """استنتاج نسبة VAT من جدول Taxes لو موجود، وإلا 16% كافتراضي."""
     try:
         for t in (doc.taxes or []):
             rate = _dec(getattr(t, "rate", 0))
@@ -137,50 +163,43 @@ def _global_vat_rate(doc) -> Decimal:
         pass
     return Decimal("16.0")
 
-def _payment_method_name(doc) -> str:
-    """011 نقدي / 021 آجل (لـ name attribute فقط)."""
-    try:
-        if float(getattr(doc, "outstanding_amount", 0) or 0) <= 0.0001 or int(getattr(doc, "is_pos", 0) or 0):
-            return "011"
-    except Exception:
-        pass
-    return "021"
-
-# =====================================================
+# ================================
 # Public: build UBL XML
-# =====================================================
+# ================================
 
 def build_invoice_xml(sales_invoice_name: str) -> str:
     """
-    توليد UBL 2.1 متوافق مع JoFotara (ستايل أوده):
+    يولد UBL 2.1 مطابق لستايل الـXML المقبول:
       - ProfileID=reporting:1.0
+      - name="022" ثابت مع قيمة 388
       - Document/TaxCurrencyCode = JOD، لكن كل currencyID داخل المبالغ = JO
-      - Header TaxTotal بدون أي TaxSubtotal
-      - إضافة AllowanceCharge=0.000 على الهيدر وعلى السعر لكل سطر (DISCOUNT)
-      - TaxSubtotal على مستوى السطر فقط، مع schemeAgencyID/ID
-      - RoundingAmount اختياري على السطر ويُساوي Payable لو فاتورة سطر واحد
+      - Header TaxTotal بدون TaxSubtotal
+      - AllowanceCharge=0.000 في الهيدر وتحت السعر
+      - TaxSubtotal على مستوى السطر فقط + attributes
+      - RoundingAmount على السطر لو فاتورة سطر واحد (= Payable)
     """
     doc = frappe.get_doc("Sales Invoice", sales_invoice_name)
 
-    # ========== بيانات أساسية ==========
+    # ===== basic =====
     issue_date = str(getdate(getattr(doc, "posting_date", None)) or getdate())
     inv_code = CREDIT_NOTE if int(getattr(doc, "is_return", 0) or 0) == 1 else INVOICE
-    inv_name_attr = _payment_method_name(doc) if inv_code == INVOICE else "022"  # لا تؤثر حسابياً
-    supplier_name, supplier_tax = _company_info(doc.company)
-    customer_name = _customer_name(doc)
-    activity = _activity_number()  # مطلوب
 
-    # عملة المستند
+    # **ثبّتنا name="022"** لمطابقة الـXML المقبول
+    inv_name_attr = "022"
+
+    company_doc, supplier_tax = _company_info(doc.company)
+    supplier_name = (company_doc.get("company_name") or company_doc.get("name") or doc.company).strip()
+    customer_name = _customer_name(doc)
+    activity = _activity_number()  # Required
+
     currency_doc = (doc.currency or CURRENCY_CODE_DOC).upper() or CURRENCY_CODE_DOC
-    # المبالغ الداخلية كلها بـ JO
     cur_id = CURRENCY_ID_AMT
 
-    # ========== حساب الإجماليات من البنود ==========
+    # ===== totals from lines =====
     lines: List[Dict] = []
     net_sum = Decimal("0.0")
     vat_sum = Decimal("0.0")
     header_discount = _dec(getattr(doc, "discount_amount", 0) or 0)
-
     global_vat = _global_vat_rate(doc)
 
     for it in (doc.items or []):
@@ -189,10 +208,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
         unit_code = _uom_code(getattr(it, "uom", None))
         line_disc = _dec(getattr(it, "discount_amount", 0) or 0)
 
-        # VAT per line: من item_tax_rate وإلا من العام
-        vat_rate = _parse_item_vat_rate(it)
-        if vat_rate == 0:
-            vat_rate = global_vat
+        vat_rate = _parse_item_vat_rate(it) or global_vat
 
         line_net = (qty * rate) - line_disc
         if line_net < 0:
@@ -215,47 +231,49 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
             "line_disc": line_disc,
         })
 
-    # خصم هيدر (زي مثال أوده — غالبًا 0)
     net_after_header_disc = net_sum - header_discount
     if net_after_header_disc < 0:
         net_after_header_disc = Decimal("0.0")
 
-    # إجمالي شامل الضريبة
     inclusive_total = net_after_header_disc + vat_sum
-    payable = inclusive_total  # بدون تقريب إضافي
+    payable = inclusive_total  # no extra rounding
 
-    # ========== بناء XML ==========
+    # ===== XML =====
     inv = Element(_qn("inv", "Invoice"))
 
-    # Header
+    # Header (match Odoo)
     SubElement(inv, _qn("cbc", "ProfileID")).text = "reporting:1.0"
     SubElement(inv, _qn("cbc", "ID")).text = str(doc.name)
-    SubElement(inv, _qn("cbc", "UUID")).text = str(getattr(doc, "name"))
+    # UUID حقيقي بدل اسم المستند
+    SubElement(inv, _qn("cbc", "UUID")).text = str(uuid.uuid4())
     SubElement(inv, _qn("cbc", "IssueDate")).text = issue_date
     SubElement(inv, _qn("cbc", "InvoiceTypeCode"), {"name": inv_name_attr}).text = inv_code
     SubElement(inv, _qn("cbc", "DocumentCurrencyCode")).text = currency_doc
     SubElement(inv, _qn("cbc", "TaxCurrencyCode")).text = currency_doc
 
-    # ICV (counter)
     add_doc = SubElement(inv, _qn("cac", "AdditionalDocumentReference"))
     SubElement(add_doc, _qn("cbc", "ID")).text = "ICV"
+    # لو عندك عدّاد داخلي للـICV استبدله هنا
     SubElement(add_doc, _qn("cbc", "UUID")).text = "1"
 
     # Supplier
     acc_sup = SubElement(inv, _qn("cac", "AccountingSupplierParty"))
     party = SubElement(acc_sup, _qn("cac", "Party"))
 
-    # عنوان بسيط
     addr = SubElement(party, _qn("cac", "PostalAddress"))
+    # PostalZone لو متاح
+    pz = _company_postal_zone(company_doc)
+    if pz:
+        SubElement(addr, _qn("cbc", "PostalZone")).text = pz
     SubElement(addr, _qn("cbc", "CountrySubentityCode")).text = "JO-AM"
     ctry = SubElement(addr, _qn("cac", "Country"))
     SubElement(ctry, _qn("cbc", "IdentificationCode")).text = "JO"
 
+    pts = SubElement(party, _qn("cac", "PartyTaxScheme"))
     if supplier_tax:
-        pts = SubElement(party, _qn("cac", "PartyTaxScheme"))
         SubElement(pts, _qn("cbc", "CompanyID")).text = supplier_tax
-        ts = SubElement(pts, _qn("cac", "TaxScheme"))
-        SubElement(ts, _qn("cbc", "ID")).text = "VAT"
+    ts = SubElement(pts, _qn("cac", "TaxScheme"))
+    SubElement(ts, _qn("cbc", "ID")).text = "VAT"
 
     ple = SubElement(party, _qn("cac", "PartyLegalEntity"))
     SubElement(ple, _qn("cbc", "RegistrationName")).text = supplier_name
@@ -265,7 +283,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     party = SubElement(acc_cus, _qn("cac", "Party"))
 
     pid = SubElement(party, _qn("cac", "PartyIdentification"))
-    SubElement(pid, _qn("cbc", "ID"), {"schemeID": "TN"})  # فارغ زي المثال المقبول
+    SubElement(pid, _qn("cbc", "ID"), {"schemeID": "TN"})  # فارغ زى المثال المقبول
 
     addr = SubElement(party, _qn("cac", "PostalAddress"))
     SubElement(addr, _qn("cbc", "CountrySubentityCode")).text = "JO-AM"
@@ -286,13 +304,13 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
         pid2 = SubElement(p2, _qn("cac", "PartyIdentification"))
         SubElement(pid2, _qn("cbc", "ID")).text = activity
 
-    # Header AllowanceCharge (0 لو مفيش خصم)
+    # Header AllowanceCharge (0)
     ac = SubElement(inv, _qn("cac", "AllowanceCharge"))
     SubElement(ac, _qn("cbc", "ChargeIndicator")).text = "false"
     SubElement(ac, _qn("cbc", "AllowanceChargeReason")).text = "discount"
     SubElement(ac, _qn("cbc", "Amount"), {"currencyID": cur_id}).text = _fmt(header_discount)
 
-    # Header TaxTotal — بدون Subtotal
+    # Header TaxTotal (no Subtotal)
     head_tax = SubElement(inv, _qn("cac", "TaxTotal"))
     SubElement(head_tax, _qn("cbc", "TaxAmount"), {"currencyID": cur_id}).text = _fmt(vat_sum)
 
@@ -308,14 +326,13 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     for idx, L in enumerate(lines, start=1):
         il = SubElement(inv, _qn("cac", "InvoiceLine"))
         SubElement(il, _qn("cbc", "ID")).text = str(idx)
-        SubElement(il, _qn("cbc", "InvoicedQuantity"), {"unitCode": L["unit_code"]}).text = _fmt(L["qty"], 1)
+        SubElement(il, _qn("cbc", "InvoicedQuantity"), {"unitCode": L["unit_code"]}).text = _fmt_qty(L["qty"])
         SubElement(il, _qn("cbc", "LineExtensionAmount"), {"currencyID": cur_id}).text = _fmt(L["line_net"])
 
-        # TaxTotal على مستوى السطر + Subtotal
+        # Line TaxTotal + Subtotal
         ttotal = SubElement(il, _qn("cac", "TaxTotal"))
         SubElement(ttotal, _qn("cbc", "TaxAmount"), {"currencyID": cur_id}).text = _fmt(L["line_vat"])
         if single_line:
-            # زى مثال أوده — بنحط RoundingAmount=Payable لو السطر واحد
             SubElement(ttotal, _qn("cbc", "RoundingAmount"), {"currencyID": cur_id}).text = _fmt(payable)
 
         tsub = SubElement(ttotal, _qn("cac", "TaxSubtotal"))
@@ -331,7 +348,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
         item = SubElement(il, _qn("cac", "Item"))
         SubElement(item, _qn("cbc", "Name")).text = L["name"]
 
-        # Price + AllowanceCharge (DISCOUNT) = line_discount
+        # Price + AC
         price = SubElement(il, _qn("cac", "Price"))
         SubElement(price, _qn("cbc", "PriceAmount"), {"currencyID": cur_id}).text = _fmt(L["unit_price"])
         pac = SubElement(price, _qn("cac", "AllowanceCharge"))
@@ -341,7 +358,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
 
     xml = tostring(inv, encoding="utf-8", method="xml").decode("utf-8")
 
-    # Snapshot اختياري في الإعدادات لتسهيل الديبَج
+    # اختياري: snapshot آخر XML
     try:
         s = _get_settings()
         if s.meta.has_field("last_xml"):
