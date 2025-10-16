@@ -217,8 +217,8 @@ def build_invoice_xml(name: str) -> str:
             "line_excl": line_excl,
             "line_vat": line_vat,
             "line_special": line_special,
-            "vat_percent": vat_rate,          # لِـ cbc:Percent
-            "special_percent": spl_rate,      # لِـ cbc:Percent
+            "vat_percent": vat_rate,
+            "special_percent": spl_rate,
             "price_after_disc": price_after_disc,
             "line_disc_total": _q3(line_disc_field + pro_rata),
         })
@@ -235,7 +235,7 @@ def build_invoice_xml(name: str) -> str:
     add(f'  <cbc:ID>{_escape(doc_id)}</cbc:ID>')
     add(f'  <cbc:UUID>{_escape(uuid_val)}</cbc:UUID>')
     add(f'  <cbc:IssueDate>{_escape(issue_date)}</cbc:IssueDate>')
-    add(f'  <cbc:InvoiceTypeCode name="{_escape(pay_name_code)}">{INVOICE if inv_type_code==INVOICE else CREDIT_NOTE}</cbc:InvoiceTypeCode>')
+    add(f'  <cbc:InvoiceTypeCode name="{_escape(_payment_method_code(doc))}">{INVOICE if not _is_credit(doc) else CREDIT_NOTE}</cbc:InvoiceTypeCode>')
     note_txt = (getattr(doc, "remarks", "") or getattr(doc, "note", "") or "").strip()
     if note_txt: add(f'  <cbc:Note>{_escape(note_txt)}</cbc:Note>')
     add(f'  <cbc:DocumentCurrencyCode>{_escape(currency)}</cbc:DocumentCurrencyCode>')
@@ -285,7 +285,7 @@ def build_invoice_xml(name: str) -> str:
     add('    </cac:Party>')
     add('  </cac:SellerSupplierParty>')
 
-    # --- TaxTotal (overall): VAT دائمًا؛ Special فقط لو > 0 ---
+    # --- TaxTotal (overall): VAT + Special(صفر دائمًا لو غير مطبّقة) ---
     add('  <cac:TaxTotal>')
     add(f'    <cbc:TaxAmount currencyID="{_escape(currency)}">{_fmt(tax_total)}</cbc:TaxAmount>')
 
@@ -301,30 +301,30 @@ def build_invoice_xml(name: str) -> str:
     add('      </cac:TaxCategory>')
     add('    </cac:TaxSubtotal>')
 
-    # Special Subtotal فقط لو فعليًا > 0
-    if total_special > 0:
-        add('    <cac:TaxSubtotal>')
-        add(f'      <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(taxable_special_sum)}</cbc:TaxableAmount>')
-        add(f'      <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(total_special)}</cbc:TaxAmount>')
-        add('      <cac:TaxCategory>')
-        add('        <cbc:ID>S</cbc:ID>')
-        percent_sp = ((total_special / taxable_special_sum * 100) if taxable_special_sum > 0 else Decimal("0"))
-        add(f'        <cbc:Percent>{_fmt(percent_sp)}</cbc:Percent>')
-        add('        <cac:TaxScheme><cbc:ID>ST</cbc:ID></cac:TaxScheme>')
-        add('      </cac:TaxCategory>')
-        add('    </cac:TaxSubtotal>')
+    # Special Subtotal — يُرسل بصفر لو غير مطبّق
+    sp_taxable = taxable_special_sum if total_special > 0 else Decimal("0")
+    sp_amount  = total_special          if total_special > 0 else Decimal("0")
+    sp_percent = ((total_special / taxable_special_sum * 100) if taxable_special_sum > 0 else Decimal("0"))
+    add('    <cac:TaxSubtotal>')
+    add(f'      <cbc:TaxableAmount currencyID="{_escape(currency)}">{_fmt(sp_taxable)}</cbc:TaxableAmount>')
+    add(f'      <cbc:TaxAmount    currencyID="{_escape(currency)}">{_fmt(sp_amount)}</cbc:TaxAmount>')
+    add('      <cac:TaxCategory>')
+    add('        <cbc:ID>S</cbc:ID>')
+    add(f'        <cbc:Percent>{_fmt(sp_percent)}</cbc:Percent>')
+    add('        <cac:TaxScheme><cbc:ID>ST</cbc:ID></cac:TaxScheme>')
+    add('      </cac:TaxCategory>')
+    add('    </cac:TaxSubtotal>')
 
     add('  </cac:TaxTotal>')
 
-    # --- LegalMonetaryTotal (بدون Rounding) ---
+    # --- LegalMonetaryTotal (بدون Rounding نهائيًا) ---
     add('  <cac:LegalMonetaryTotal>')
     add(f'    <cbc:TaxExclusiveAmount currencyID="{_escape(currency)}">{_fmt(tax_exclusive)}</cbc:TaxExclusiveAmount>')
     add(f'    <cbc:TaxInclusiveAmount currencyID="{_escape(currency)}">{_fmt(tax_inclusive)}</cbc:TaxInclusiveAmount>')
 
-    # خصم عام على الفاتورة كـ AllowanceTotalAmount وفق الدليل
+    # خصم عام على الفاتورة كـ AllowanceTotalAmount — يُرسل حتى لو صفر
     invoice_discount = _q3(getattr(doc, "discount_amount", 0) or 0)
-    if invoice_discount > 0:
-        add(f'    <cbc:AllowanceTotalAmount currencyID="{_escape(currency)}">{_fmt(invoice_discount)}</cbc:AllowanceTotalAmount>')
+    add(f'    <cbc:AllowanceTotalAmount currencyID="{_escape(currency)}">{_fmt(invoice_discount)}</cbc:AllowanceTotalAmount>')
 
     payable_amount = _q3(tax_inclusive - invoice_discount)
     add(f'    <cbc:PayableAmount currencyID="{_escape(currency)}">{_fmt(payable_amount)}</cbc:PayableAmount>')
