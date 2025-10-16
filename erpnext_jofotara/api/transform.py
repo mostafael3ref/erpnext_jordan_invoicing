@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Tuple
-from xml.etree.ElementTree import Element, SubElement, tostring, ElementTree
+from xml.etree.ElementTree import Element, SubElement, tostring
+import xml.etree.ElementTree as ET  # ← استخدم الموديول باسم ET
 import json
 import re
 
@@ -22,8 +23,9 @@ NS = {
     "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
     "ext": "urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2",
 }
+# ✅ التصحيح هنا: استخدم ET.register_namespace (مش ElementTree.register_namespace)
 for p, uri in NS.items():
-    ElementTree.register_namespace("" if p == "inv" else p, uri)
+    ET.register_namespace("" if p == "inv" else p, uri)
 
 CURRENCY_CODE_DOC = "JOD"  # في رأس المستند
 CURRENCY_ID_AMT = "JO"     # داخل الحقول النقدية
@@ -234,7 +236,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     SubElement(inv, _qn("cbc", "DocumentCurrencyCode")).text = currency_doc
     SubElement(inv, _qn("cbc", "TaxCurrencyCode")).text = currency_doc
 
-    # ICV (counter) — ممكن تستخدم doc.docstatus كتجريبي أو احتفظ بعدّاد داخلي؛ هنستخدم 1 هنا
+    # ICV (counter)
     add_doc = SubElement(inv, _qn("cac", "AdditionalDocumentReference"))
     SubElement(add_doc, _qn("cbc", "ID")).text = "ICV"
     SubElement(add_doc, _qn("cbc", "UUID")).text = "1"
@@ -243,7 +245,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     acc_sup = SubElement(inv, _qn("cac", "AccountingSupplierParty"))
     party = SubElement(acc_sup, _qn("cac", "Party"))
 
-    # عنوان بسيط (اختياري)
+    # عنوان بسيط
     addr = SubElement(party, _qn("cac", "PostalAddress"))
     SubElement(addr, _qn("cbc", "CountrySubentityCode")).text = "JO-AM"
     ctry = SubElement(addr, _qn("cac", "Country"))
