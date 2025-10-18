@@ -171,6 +171,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
       - AllowanceCharge=0.000 في الهيدر وتحت السعر
       - الكميات في المرتجع موجبة (زي Odoo)
       - BillingReference و PaymentMeans في المرتجع
+      - ✅ ترتيب العناصر يراعي الـ XSD (PaymentMeans بعد SellerSupplierParty)
     """
     doc = frappe.get_doc("Sales Invoice", sales_invoice_name)
 
@@ -237,50 +238,40 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     # Header
     SubElement(inv, _qn("cbc", "ProfileID")).text = "reporting:1.0"
     SubElement(inv, _qn("cbc", "ID")).text = str(doc.name)
+
     # استخدم UUID محفوظ إن وجد، وإلا أنشئ واحد جديد
     uuid_value = getattr(doc, "jofotara_uuid", "") or ""
     if not uuid_value:
         uuid_value = str(uuid.uuid4())
     SubElement(inv, _qn("cbc", "UUID")).text = uuid_value
+
     SubElement(inv, _qn("cbc", "IssueDate")).text = issue_date
     SubElement(inv, _qn("cbc", "InvoiceTypeCode"), {"name": inv_name_attr}).text = inv_code
     SubElement(inv, _qn("cbc", "DocumentCurrencyCode")).text = currency_doc
     SubElement(inv, _qn("cbc", "TaxCurrencyCode")).text = currency_doc
 
-    # للمرتجع: BillingReference + PaymentMeans مثل Odoo
+    # المرتجع: BillingReference (قبل AdditionalDocumentReference حسب الـXSD المقبول)
+    orig_id = ""
+    orig_uuid = ""
+    orig_total = None
     if is_return:
-        original_id = getattr(doc, "return_against", "") or getattr(doc, "amended_from", "") or ""
-        orig_uuid = ""
-        orig_total = None
-        if original_id:
+        orig_id = getattr(doc, "return_against", "") or getattr(doc, "amended_from", "") or ""
+        if orig_id:
             try:
-                orig = frappe.get_doc("Sales Invoice", original_id)
+                orig = frappe.get_doc("Sales Invoice", orig_id)
                 orig_total = _dec(getattr(orig, "grand_total", 0) or 0)
-                # لو عندك حقل UUID محفوظ في الأصل
                 orig_uuid = getattr(orig, "jofotara_uuid", "") or ""
             except Exception:
                 pass
 
-        # BillingReference
         br = SubElement(inv, _qn("cac", "BillingReference"))
         invref = SubElement(br, _qn("cac", "InvoiceDocumentReference"))
-        if original_id:
-            SubElement(invref, _qn("cbc", "ID")).text = original_id
+        if orig_id:
+            SubElement(invref, _qn("cbc", "ID")).text = orig_id
         if orig_uuid:
             SubElement(invref, _qn("cbc", "UUID")).text = orig_uuid
         if orig_total is not None:
-            # Odoo يضع الإجمالي الشامل كنص في DocumentDescription
             SubElement(invref, _qn("cbc", "DocumentDescription")).text = _fmt(orig_total)
-
-        # PaymentMeans
-        pm = SubElement(inv, _qn("cac", "PaymentMeans"))
-        SubElement(pm, _qn("cbc", "PaymentMeansCode"), {"listID": "UN/ECE 4461"}).text = "10"
-        reason = getattr(doc, "remarks", "") or "مرتجع"
-        if original_id:
-            note = f"عكس: {original_id}, {reason}"
-        else:
-            note = reason
-        SubElement(pm, _qn("cbc", "InstructionNote")).text = note
 
     # AdditionalDocumentReference: ICV
     add_doc = SubElement(inv, _qn("cac", "AdditionalDocumentReference"))
@@ -332,6 +323,14 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
         p2 = SubElement(ssp, _qn("cac", "Party"))
         pid2 = SubElement(p2, _qn("cac", "PartyIdentification"))
         SubElement(pid2, _qn("cbc", "ID")).text = activity
+
+    # ✅ PaymentMeans يأتي هنا (بعد SellerSupplierParty) فى حالة المرتجع
+    if is_return:
+        pm = SubElement(inv, _qn("cac", "PaymentMeans"))
+        SubElement(pm, _qn("cbc", "PaymentMeansCode"), {"listID": "UN/ECE 4461"}).text = "10"
+        reason = getattr(doc, "remarks", "") or "مرتجع"
+        note = f"عكس: {orig_id}, {reason}" if orig_id else reason
+        SubElement(pm, _qn("cbc", "InstructionNote")).text = note
 
     # Header AllowanceCharge (0)
     ac = SubElement(inv, _qn("cac", "AllowanceCharge"))
