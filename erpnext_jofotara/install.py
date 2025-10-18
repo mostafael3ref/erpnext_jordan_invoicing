@@ -31,6 +31,13 @@ _FIELDS = {
             no_copy=1,
             insert_after="jofotara_uuid",
         ),
+        dict(
+             fieldname="jofotara_qr_image",   # لازم يطابق اللي في الكود
+             label="JoFotara QR Image",
+             fieldtype="Attach Image",
+             insert_after="jofotara_qr",
+             allow_on_submit=1
+            ),
         # اختياري للتجربة اليدوية أو مراجعة الـ XML المولّد
         # dict(
         #     fieldname="jofotara_xml",
