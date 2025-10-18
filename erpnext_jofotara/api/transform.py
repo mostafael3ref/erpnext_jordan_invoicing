@@ -57,7 +57,7 @@ def _fmt(x, places: int = 3) -> str:
     return f"{_q3(x):.{places}f}"
 
 def _fmt_qty(x) -> str:
-    # زى Odoo: كمية بعُشر واحد (1.0 / 25.0)
+    # زي Odoo: كمية بعُشر واحد (1.0 / 25.0)
     return f"{float(x):.1f}"
 
 def _get_settings():
@@ -66,14 +66,12 @@ def _get_settings():
 def _company_info(company: str) -> Tuple[dict, str]:
     """
     يرجّع (company_doc_as_dict, tax_id_fallback)
-    هنحتاج PostalZone لو متاحة من العنوان.
     """
     tax = ""
     cd = {}
     try:
         c = frappe.get_doc("Company", company)
         cd = c.as_dict()
-        # probable tax fields
         for f in ("tax_id", "company_tax_id", "tax_no", "tax_number"):
             if getattr(c, f, None):
                 tax = str(getattr(c, f)).strip()
@@ -89,10 +87,6 @@ def _company_info(company: str) -> Tuple[dict, str]:
     return cd, tax
 
 def _company_postal_zone(company_doc: dict) -> str:
-    """
-    حاول تجيب PostalZone من Company Address إن وُجد.
-    هنقرأ العنوان الافتراضي المرتبط بالشركة لو متاح.
-    """
     try:
         addr_link = frappe.get_all(
             "Dynamic Link",
@@ -101,14 +95,13 @@ def _company_postal_zone(company_doc: dict) -> str:
         )
         if addr_link:
             addr = frappe.get_doc("Address", addr_link[0]["parent"])
-            # common fields: pincode / zip / postal_code / po_box
             for f in ("pincode", "zip", "postal_code", "po_box"):
                 v = (getattr(addr, f, None) or "").strip()
                 if v:
                     return v
     except Exception:
         pass
-    return ""  # سيُرسل فاضي لو مش متاح
+    return ""
 
 def _customer_name(doc) -> str:
     nm = (getattr(doc, "customer_name", "") or getattr(doc, "customer", "") or "").strip()
@@ -169,28 +162,27 @@ def _global_vat_rate(doc) -> Decimal:
 
 def build_invoice_xml(sales_invoice_name: str) -> str:
     """
-    يولد UBL 2.1 مطابق لستايل الـXML المقبول:
+    يولّد UBL 2.1 بمعيار Odoo المقبول لدى JoFotara:
       - ProfileID=reporting:1.0
-      - name="022" ثابت مع قيمة 388
-      - Document/TaxCurrencyCode = JOD، لكن كل currencyID داخل المبالغ = JO
-      - Header TaxTotal بدون TaxSubtotal
+      - name="022" مع القيمة 388 للفاتورة، 381 للمرتجع
+      - Document/TaxCurrencyCode = JOD، وكل currencyID داخل المبالغ = JO
+      - الفاتورة: Header TaxTotal بدون Subtotal
+      - المرتجع: Header TaxTotal + TaxSubtotal
       - AllowanceCharge=0.000 في الهيدر وتحت السعر
-      - TaxSubtotal على مستوى السطر فقط + attributes
-      - RoundingAmount على السطر لو فاتورة سطر واحد (= Payable)
+      - الكميات في المرتجع موجبة (زي Odoo)
+      - BillingReference و PaymentMeans في المرتجع
     """
     doc = frappe.get_doc("Sales Invoice", sales_invoice_name)
 
-    # ===== basic =====
+    is_return = int(getattr(doc, "is_return", 0) or 0) == 1
     issue_date = str(getdate(getattr(doc, "posting_date", None)) or getdate())
-    inv_code = CREDIT_NOTE if int(getattr(doc, "is_return", 0) or 0) == 1 else INVOICE
-
-    # **ثبّتنا name="022"** لمطابقة الـXML المقبول
-    inv_name_attr = "022"
+    inv_code = CREDIT_NOTE if is_return else INVOICE
+    inv_name_attr = "022"  # ثابت زي المثال المقبول
 
     company_doc, supplier_tax = _company_info(doc.company)
     supplier_name = (company_doc.get("company_name") or company_doc.get("name") or doc.company).strip()
     customer_name = _customer_name(doc)
-    activity = _activity_number()  # Required
+    activity = _activity_number()
 
     currency_doc = (doc.currency or CURRENCY_CODE_DOC).upper() or CURRENCY_CODE_DOC
     cur_id = CURRENCY_ID_AMT
@@ -203,10 +195,11 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     global_vat = _global_vat_rate(doc)
 
     for it in (doc.items or []):
-        qty = _dec(getattr(it, "qty", 0) or 0)
-        rate = _dec(getattr(it, "rate", 0) or 0)
+        raw_qty = _dec(getattr(it, "qty", 0) or 0)
+        qty = abs(raw_qty) if is_return else raw_qty
+        rate = abs(_dec(getattr(it, "rate", 0) or 0)) if is_return else _dec(getattr(it, "rate", 0) or 0)
         unit_code = _uom_code(getattr(it, "uom", None))
-        line_disc = _dec(getattr(it, "discount_amount", 0) or 0)
+        line_disc = abs(_dec(getattr(it, "discount_amount", 0) or 0)) if is_return else _dec(getattr(it, "discount_amount", 0) or 0)
 
         vat_rate = _parse_item_vat_rate(it) or global_vat
 
@@ -236,32 +229,68 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
         net_after_header_disc = Decimal("0.0")
 
     inclusive_total = net_after_header_disc + vat_sum
-    payable = inclusive_total  # no extra rounding
+    payable = inclusive_total
 
     # ===== XML =====
     inv = Element(_qn("inv", "Invoice"))
 
-    # Header (match Odoo)
+    # Header
     SubElement(inv, _qn("cbc", "ProfileID")).text = "reporting:1.0"
     SubElement(inv, _qn("cbc", "ID")).text = str(doc.name)
-    # UUID حقيقي بدل اسم المستند
-    SubElement(inv, _qn("cbc", "UUID")).text = str(uuid.uuid4())
+    # استخدم UUID محفوظ إن وجد، وإلا أنشئ واحد جديد
+    uuid_value = getattr(doc, "jofotara_uuid", "") or ""
+    if not uuid_value:
+        uuid_value = str(uuid.uuid4())
+    SubElement(inv, _qn("cbc", "UUID")).text = uuid_value
     SubElement(inv, _qn("cbc", "IssueDate")).text = issue_date
     SubElement(inv, _qn("cbc", "InvoiceTypeCode"), {"name": inv_name_attr}).text = inv_code
     SubElement(inv, _qn("cbc", "DocumentCurrencyCode")).text = currency_doc
     SubElement(inv, _qn("cbc", "TaxCurrencyCode")).text = currency_doc
 
+    # للمرتجع: BillingReference + PaymentMeans مثل Odoo
+    if is_return:
+        original_id = getattr(doc, "return_against", "") or getattr(doc, "amended_from", "") or ""
+        orig_uuid = ""
+        orig_total = None
+        if original_id:
+            try:
+                orig = frappe.get_doc("Sales Invoice", original_id)
+                orig_total = _dec(getattr(orig, "grand_total", 0) or 0)
+                # لو عندك حقل UUID محفوظ في الأصل
+                orig_uuid = getattr(orig, "jofotara_uuid", "") or ""
+            except Exception:
+                pass
+
+        # BillingReference
+        br = SubElement(inv, _qn("cac", "BillingReference"))
+        invref = SubElement(br, _qn("cac", "InvoiceDocumentReference"))
+        if original_id:
+            SubElement(invref, _qn("cbc", "ID")).text = original_id
+        if orig_uuid:
+            SubElement(invref, _qn("cbc", "UUID")).text = orig_uuid
+        if orig_total is not None:
+            # Odoo يضع الإجمالي الشامل كنص في DocumentDescription
+            SubElement(invref, _qn("cbc", "DocumentDescription")).text = _fmt(orig_total)
+
+        # PaymentMeans
+        pm = SubElement(inv, _qn("cac", "PaymentMeans"))
+        SubElement(pm, _qn("cbc", "PaymentMeansCode"), {"listID": "UN/ECE 4461"}).text = "10"
+        reason = getattr(doc, "remarks", "") or "مرتجع"
+        if original_id:
+            note = f"عكس: {original_id}, {reason}"
+        else:
+            note = reason
+        SubElement(pm, _qn("cbc", "InstructionNote")).text = note
+
+    # AdditionalDocumentReference: ICV
     add_doc = SubElement(inv, _qn("cac", "AdditionalDocumentReference"))
     SubElement(add_doc, _qn("cbc", "ID")).text = "ICV"
-    # لو عندك عدّاد داخلي للـICV استبدله هنا
     SubElement(add_doc, _qn("cbc", "UUID")).text = "1"
 
     # Supplier
     acc_sup = SubElement(inv, _qn("cac", "AccountingSupplierParty"))
     party = SubElement(acc_sup, _qn("cac", "Party"))
-
     addr = SubElement(party, _qn("cac", "PostalAddress"))
-    # PostalZone لو متاح
     pz = _company_postal_zone(company_doc)
     if pz:
         SubElement(addr, _qn("cbc", "PostalZone")).text = pz
@@ -283,7 +312,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     party = SubElement(acc_cus, _qn("cac", "Party"))
 
     pid = SubElement(party, _qn("cac", "PartyIdentification"))
-    SubElement(pid, _qn("cbc", "ID"), {"schemeID": "TN"})  # فارغ زى المثال المقبول
+    SubElement(pid, _qn("cbc", "ID"), {"schemeID": "TN"})
 
     addr = SubElement(party, _qn("cac", "PostalAddress"))
     SubElement(addr, _qn("cbc", "CountrySubentityCode")).text = "JO-AM"
@@ -310,15 +339,27 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
     SubElement(ac, _qn("cbc", "AllowanceChargeReason")).text = "discount"
     SubElement(ac, _qn("cbc", "Amount"), {"currencyID": cur_id}).text = _fmt(header_discount)
 
-    # Header TaxTotal (no Subtotal)
+    # Header TaxTotal
     head_tax = SubElement(inv, _qn("cac", "TaxTotal"))
     SubElement(head_tax, _qn("cbc", "TaxAmount"), {"currencyID": cur_id}).text = _fmt(vat_sum)
+    if is_return:
+        # زي Odoo في المرتجع: نضيف TaxSubtotal في الهيدر
+        hts = SubElement(head_tax, _qn("cac", "TaxSubtotal"))
+        SubElement(hts, _qn("cbc", "TaxableAmount"), {"currencyID": cur_id}).text = _fmt(net_after_header_disc)
+        SubElement(hts, _qn("cbc", "TaxAmount"), {"currencyID": cur_id}).text = _fmt(vat_sum)
+        tcat = SubElement(hts, _qn("cac", "TaxCategory"))
+        SubElement(tcat, _qn("cbc", "ID"), {"schemeAgencyID": VAT_SCHEME_AGENCY, "schemeID": VAT_SCHEME_5305}).text = "S"
+        SubElement(tcat, _qn("cbc", "Percent")).text = f"{_q3(global_vat):.1f}"
+        tsch = SubElement(tcat, _qn("cac", "TaxScheme"))
+        SubElement(tsch, _qn("cbc", "ID"), {"schemeAgencyID": VAT_SCHEME_AGENCY, "schemeID": VAT_SCHEME_5153}).text = "VAT"
 
     # LegalMonetaryTotal
     lmt = SubElement(inv, _qn("cac", "LegalMonetaryTotal"))
     SubElement(lmt, _qn("cbc", "TaxExclusiveAmount"), {"currencyID": cur_id}).text = _fmt(net_after_header_disc)
     SubElement(lmt, _qn("cbc", "TaxInclusiveAmount"), {"currencyID": cur_id}).text = _fmt(inclusive_total)
     SubElement(lmt, _qn("cbc", "AllowanceTotalAmount"), {"currencyID": cur_id}).text = _fmt(header_discount)
+    if is_return:
+        SubElement(lmt, _qn("cbc", "PrepaidAmount"), {"currencyID": cur_id}).text = _fmt(0)
     SubElement(lmt, _qn("cbc", "PayableAmount"), {"currencyID": cur_id}).text = _fmt(payable)
 
     # Lines
@@ -348,7 +389,7 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
         item = SubElement(il, _qn("cac", "Item"))
         SubElement(item, _qn("cbc", "Name")).text = L["name"]
 
-        # Price + AC
+        # Price + AllowanceCharge
         price = SubElement(il, _qn("cac", "Price"))
         SubElement(price, _qn("cbc", "PriceAmount"), {"currencyID": cur_id}).text = _fmt(L["unit_price"])
         pac = SubElement(price, _qn("cac", "AllowanceCharge"))
@@ -358,7 +399,6 @@ def build_invoice_xml(sales_invoice_name: str) -> str:
 
     xml = tostring(inv, encoding="utf-8", method="xml").decode("utf-8")
 
-    # اختياري: snapshot آخر XML
     try:
         s = _get_settings()
         if s.meta.has_field("last_xml"):
