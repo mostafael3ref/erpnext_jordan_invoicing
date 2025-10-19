@@ -2,12 +2,11 @@
 # erpnext_jofotara/api/invoices.py
 from __future__ import annotations
 
-import io
 import json
-import base64
-import requests
 from typing import Any, Dict
+from urllib.parse import quote
 
+import requests
 import frappe
 from frappe import _
 from frappe.utils import now
@@ -84,16 +83,17 @@ def _save_xml_snapshot(doc, xml_str: str) -> None:
 def _generate_qr_image_bytes(data: str) -> bytes:
     """
     توليد صورة QR باستخدام Google Charts API بدون مكتبات خارجية.
-    يعمل على Frappe Cloud بدون مشاكل.
+    يعمل على Frappe Cloud.
     """
     try:
-        # نستخدم واجهة Google لتوليد الصورة مباشرة
-        url = f"https://chart.googleapis.com/chart?cht=qr&chs=250x250&chl={data}"
-        resp = requests.get(url)
-        if resp.status_code == 200:
-            return resp.content
-        else:
-            return b""
+        # URL-encode مهم جدًا لو النص فيه + / أسطر …إلخ
+        payload = quote((data or "").strip(), safe="")
+        url = f"https://chart.googleapis.com/chart?cht=qr&chs=250x250&chld=L|0&chl={payload}"
+        for _ in range(2):  # محاولة تانية لو حصل hiccup بسيط
+            resp = requests.get(url, timeout=8)
+            if resp.ok and resp.content:
+                return resp.content
+        return b""
     except Exception:
         return b""
 
@@ -111,12 +111,10 @@ def _save_qr_image_on_invoice(inv_doc) -> None:
         if not qr_text:
             return
 
-        # توليد الصورة الفعلية من Google
         content = _generate_qr_image_bytes(qr_text)
         if not content:
             return
 
-        # حفظها كمرفق
         filedoc = frappe.get_doc({
             "doctype": "File",
             "file_name": f"{inv_doc.name}-qr.png",
@@ -126,7 +124,6 @@ def _save_qr_image_on_invoice(inv_doc) -> None:
             "attached_to_name": inv_doc.name,
         }).insert(ignore_permissions=True)
 
-        # ربطها بالحقل Attach Image
         if inv_doc.meta.has_field("jofotara_qr_image"):
             inv_doc.db_set("jofotara_qr_image", filedoc.file_url)
 
@@ -162,20 +159,16 @@ def _apply_response_to_invoice(doc, resp: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    # ⬇️ لو فيه QR نصي، حوّله لصورة واحفظها
     if qr:
         _save_qr_image_on_invoice(doc)
 
-    # حدّث الحالة: Submitted عند النجاح / Error عند الفشل
     _set_status(doc, "Submitted" if (uuid or qr) else "Error")
 
-    # تعليق بالرد (للمرجعية)
     try:
         doc.add_comment("Comment", text=json.dumps(resp, ensure_ascii=False, indent=2))
     except Exception:
         pass
 
-    # خزّن معاينة الرد في Settings
     _store_response_preview_in_settings(resp)
 
 
