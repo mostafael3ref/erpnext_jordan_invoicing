@@ -5,14 +5,12 @@ from __future__ import annotations
 import io
 import json
 import base64
+import requests
 from typing import Any, Dict
 
 import frappe
 from frappe import _
 from frappe.utils import now
-
-# نحاول استيراد مكتبة qrcode، ونستخدمها لتوليد صورة QR
-import qrcode
 
 from .client import post_invoice, to_b64          # post_invoice(b64xml) -> dict
 from .transform import build_invoice_xml          # build_invoice_xml(sales_invoice_name) -> xml string
@@ -85,16 +83,19 @@ def _save_xml_snapshot(doc, xml_str: str) -> None:
 
 def _generate_qr_image_bytes(data: str) -> bytes:
     """
-    توليد صورة QR بصيغة PNG وإرجاعها كـ bytes.
-    يستخدم مكتبة qrcode المدمجة مع Frappe/ERPNext.
+    توليد صورة QR باستخدام Google Charts API بدون مكتبات خارجية.
+    يعمل على Frappe Cloud بدون مشاكل.
     """
-    qr = qrcode.QRCode(version=1, box_size=6, border=2)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    try:
+        # نستخدم واجهة Google لتوليد الصورة مباشرة
+        url = f"https://chart.googleapis.com/chart?cht=qr&chs=250x250&chl={data}"
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            return resp.content
+        else:
+            return b""
+    except Exception:
+        return b""
 
 
 def _save_qr_image_on_invoice(inv_doc) -> None:
@@ -110,8 +111,10 @@ def _save_qr_image_on_invoice(inv_doc) -> None:
         if not qr_text:
             return
 
-        # توليد الصورة الفعلية
+        # توليد الصورة الفعلية من Google
         content = _generate_qr_image_bytes(qr_text)
+        if not content:
+            return
 
         # حفظها كمرفق
         filedoc = frappe.get_doc({
