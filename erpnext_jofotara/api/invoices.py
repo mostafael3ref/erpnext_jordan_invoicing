@@ -2,15 +2,18 @@
 # erpnext_jofotara/api/invoices.py
 from __future__ import annotations
 
+import io
 import json
 import base64
 from typing import Any, Dict
 
 import frappe
 from frappe import _
-from frappe.utils import now, get_qr_code  # نستخدم get_qr_code لتوليد صورة الـ QR من النص
+from frappe.utils import now
 
-# الاعتماد على نفس الباكدج
+# نحاول استيراد مكتبة qrcode، ونستخدمها لتوليد صورة QR
+import qrcode
+
 from .client import post_invoice, to_b64          # post_invoice(b64xml) -> dict
 from .transform import build_invoice_xml          # build_invoice_xml(sales_invoice_name) -> xml string
 
@@ -45,26 +48,18 @@ def _store_response_preview_in_settings(resp: Dict[str, Any]) -> None:
 
 
 def _set_status(doc, status: str, err: str | None = None) -> None:
-    """
-    تحديث حالة التكامل على الفاتورة.
-    NOTE: خيارات الحقل عندك: Pending / Submitted / Error
-    """
+    """تحديث حالة التكامل على الفاتورة."""
     try:
         if doc.meta.has_field("jofotara_status"):
             doc.db_set("jofotara_status", status)
         if err and doc.meta.has_field("jofotara_error"):
             doc.db_set("jofotara_error", err[:1000])
     except Exception:
-        # ما نوقف التنفيذ بسبب فشل تحديث حالة العرض فقط
         pass
 
 
 def _save_xml_snapshot(doc, xml_str: str) -> None:
-    """
-    احفظ نسخة من UBL XML على الفاتورة كمرفق،
-    ولو فيه حقل jofotara_xml اكتبه أيضاً،
-    وخزّن نسخة قصيرة في Settings (اختياري).
-    """
+    """احفظ نسخة من XML كمرفق على الفاتورة."""
     try:
         if doc.meta.has_field("jofotara_xml"):
             doc.db_set("jofotara_xml", xml_str)
@@ -84,9 +79,22 @@ def _save_xml_snapshot(doc, xml_str: str) -> None:
                 s.db_set("last_xml", xml_str[:100000])
         except Exception:
             pass
-
     except Exception:
         frappe.log_error(frappe.get_traceback(), "JoFotara - save XML snapshot")
+
+
+def _generate_qr_image_bytes(data: str) -> bytes:
+    """
+    توليد صورة QR بصيغة PNG وإرجاعها كـ bytes.
+    يستخدم مكتبة qrcode المدمجة مع Frappe/ERPNext.
+    """
+    qr = qrcode.QRCode(version=1, box_size=6, border=2)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _save_qr_image_on_invoice(inv_doc) -> None:
@@ -95,7 +103,6 @@ def _save_qr_image_on_invoice(inv_doc) -> None:
     حفظها كمرفق PNG، وتخزين رابطها في Attach Image: jofotara_qr_image.
     """
     try:
-        # لازم يكون عندنا النص (payload) في الحقل jofotara_qr
         if not inv_doc.meta.has_field("jofotara_qr"):
             return
 
@@ -103,27 +110,10 @@ def _save_qr_image_on_invoice(inv_doc) -> None:
         if not qr_text:
             return
 
-        # 1) توليد Data-URI PNG من النص
-        #    مثال: "data:image/png;base64,...."
-        data_uri = get_qr_code(qr_text)
-        prefix = "data:image/png;base64,"
-        if data_uri.startswith(prefix):
-            b64_png = data_uri[len(prefix):]
-        else:
-            # احتياط لو رجعت بدون البادئة
-            b64_png = data_uri
+        # توليد الصورة الفعلية
+        content = _generate_qr_image_bytes(qr_text)
 
-        # 2) فك Base64 إلى بايتات PNG صحيحة
-        try:
-            content = base64.b64decode(b64_png)
-        except Exception:
-            # معالجة padding لو ناقص
-            missing = len(b64_png) % 4
-            if missing:
-                b64_png += "=" * (4 - missing)
-            content = base64.b64decode(b64_png)
-
-        # 3) خزِّن الصورة كمرفق
+        # حفظها كمرفق
         filedoc = frappe.get_doc({
             "doctype": "File",
             "file_name": f"{inv_doc.name}-qr.png",
@@ -133,20 +123,16 @@ def _save_qr_image_on_invoice(inv_doc) -> None:
             "attached_to_name": inv_doc.name,
         }).insert(ignore_permissions=True)
 
-        # 4) خزِّن رابط الصورة في Attach Image (لازم يكون اسمه jofotara_qr_image)
+        # ربطها بالحقل Attach Image
         if inv_doc.meta.has_field("jofotara_qr_image"):
             inv_doc.db_set("jofotara_qr_image", filedoc.file_url)
 
     except Exception:
-        # ما نكسر العملية لو فشل التخزين
         frappe.log_error(frappe.get_traceback(), "JoFotara - save QR image")
 
 
 def _apply_response_to_invoice(doc, resp: Dict[str, Any]) -> None:
-    """
-    تطبيق الرد: حفظ UUID/QR/وقت الإرسال، توليد صورة الـ QR، تحديث الحالة،
-    إضافة تعليق بالرد، وتخزين معاينة الرد في Settings.
-    """
+    """تطبيق الرد من JoFotara وتحديث الحقول والصورة."""
     uuid = (
         resp.get("EINV_INV_UUID")
         or resp.get("UUID")
@@ -196,26 +182,17 @@ def _apply_response_to_invoice(doc, resp: Dict[str, Any]) -> None:
 
 @frappe.whitelist()
 def send_now(name: str) -> Dict[str, Any]:
-    """
-    إرسال فاتورة Sales Invoice واحدة إلى JoFotara يدويًا.
-      - بناء UBL 2.1
-      - Base64
-      - POST {"invoice": "<b64>"} إلى /core/invoices/
-    """
-    # 1) الفاتورة
+    """إرسال فاتورة Sales Invoice واحدة إلى JoFotara يدويًا."""
     doc = frappe.get_doc("Sales Invoice", name)
 
-    # 2) توليد XML (يراعي 388 للفاتورة و 381 للاشعار الدائن)
     xml = build_invoice_xml(doc.name)
     if not xml:
         frappe.throw(_("Failed to build UBL 2.1 XML for this invoice."))
 
-    # 3) Snapshot + Base64
     xml_min = _minify_xml(xml)
     _save_xml_snapshot(doc, xml_min)
     b64 = to_b64(xml_min)
 
-    # 4) الإرسال
     try:
         resp = post_invoice(b64)
     except Exception as e:
@@ -223,19 +200,14 @@ def send_now(name: str) -> Dict[str, Any]:
         frappe.log_error(frappe.get_traceback(), "JoFotara Send Now Error")
         raise
 
-    # 5) تطبيق الرد
     _apply_response_to_invoice(doc, resp)
 
-    # 6) إشعار
     frappe.msgprint(_("JoFotara: Invoice submitted successfully."), alert=1, indicator="green")
     return resp
 
 
 def on_submit_sales_invoice(doc, method: str | None = None) -> None:
-    """
-    Hook يُستدعى عند Submit للفاتورة — يرسل تلقائيًا لو الخيار مفعّل في الإعدادات.
-    يدعم الاسمين: send_on_submit و auto_send_on_submit.
-    """
+    """Hook عند Submit للفاتورة — يرسل تلقائيًا لو الخيار مفعّل في الإعدادات."""
     try:
         s = _get_settings()
         enabled = 0
@@ -260,5 +232,5 @@ def on_submit_send(doc, method=None):
 
 @frappe.whitelist()
 def retry_pending_jobs():
-    # TODO: لو حبيت تعمل retries لاحقًا
+    # مستقبلًا: تقدر تضيف هنا منطق إعادة الإرسال التلقائي
     pass
