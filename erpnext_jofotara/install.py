@@ -26,19 +26,19 @@ _FIELDS = {
         dict(
             fieldname="jofotara_qr",
             label="JoFotara QR",
-            fieldtype="Small Text",  # أو Long Text لو حابب
+            fieldtype="Small Text",
             read_only=1,
             no_copy=1,
             insert_after="jofotara_uuid",
         ),
         dict(
-             fieldname="jofotara_qr_image",   # لازم يطابق اللي في الكود
-             label="JoFotara QR Image",
-             fieldtype="Attach Image",
-             insert_after="jofotara_qr",
-             allow_on_submit=1
-            ),
-        # اختياري للتجربة اليدوية أو مراجعة الـ XML المولّد
+            fieldname="jofotara_qr_image",
+            label="JoFotara QR Image",
+            fieldtype="Attach Image",
+            insert_after="jofotara_qr",
+            allow_on_submit=1,
+        ),
+        # (اختياري)
         # dict(
         #     fieldname="jofotara_xml",
         #     label="JoFotara UBL XML",
@@ -49,17 +49,12 @@ _FIELDS = {
 }
 
 def ensure_custom_fields():
+    """Create/Update custom fields idempotently every time."""
     if not frappe.db.exists("DocType", "Sales Invoice"):
         return
-    # تقدر تشيل الشرط وتستدعي مباشرةً لتحديث/إضافة الحقول دائمًا
-    needed = ("jofotara_status", "jofotara_uuid", "jofotara_qr")
-    missing = [
-        fn for fn in needed
-        if not frappe.db.exists("Custom Field", {"dt": "Sales Invoice", "fieldname": fn})
-    ]
-    if missing:
-        create_custom_fields(_FIELDS, ignore_validate=True)
-        frappe.clear_cache(doctype="Sales Invoice")
+    # important: update=True يحدّث الحقول لو كانت موجودة
+    create_custom_fields(_FIELDS, ignore_validate=True, update=True)
+    frappe.clear_cache(doctype="Sales Invoice")
 
 def after_install():
     ensure_custom_fields()
